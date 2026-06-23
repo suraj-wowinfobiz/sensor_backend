@@ -1,0 +1,367 @@
+package com.wowinfobiz.ingestionservice.service;
+
+import com.wowinfobiz.ingestionservice.dto.SensorReadingRequest;
+import com.wowinfobiz.ingestionservice.dto.SensorReadingResponse;
+import com.wowinfobiz.ingestionservice.dto.SensorReadingView;
+import com.wowinfobiz.ingestionservice.model.SensorReading;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.lang.Nullable;
+import org.springframework.stereotype.Service;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
+
+import java.io.IOException;
+import java.time.Instant;
+import java.time.format.DateTimeParseException;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.stream.Collectors;
+
+@Service
+public class IngestionService {
+    private static final Logger LOG = LoggerFactory.getLogger(IngestionService.class);
+
+    private static final String DEFAULT_SENSOR_ID = "unknown";
+    private static final List<String> SENSOR_ID_KEYS = List.of("sensorId", "sensor_id", "deviceId", "device_id", "id");
+    private static final List<String> TIMESTAMP_KEYS = List.of("timestamp", "time", "ts", "createdAt", "created_at");
+    private static final List<String> PARAMETERS_KEYS = List.of("parameters", "readings", "data", "values", "payload");
+    private static final List<String> DATA_TYPE_KEYS = List.of("dataType", "data_type", "sensorType", "sensor_type", "type");
+
+    private final Map<UUID, SensorReading> readingsById = new ConcurrentHashMap<>();
+    private final List<SseEmitter> emitters = new CopyOnWriteArrayList<>();
+    @Nullable
+    private final KafkaTemplate<Object, Object> kafkaTemplate;
+    private final String ingestionTopic;
+
+    public IngestionService(@Nullable KafkaTemplate<Object, Object> kafkaTemplate,
+                            @Value("${app.kafka.topics.ingestion}") String ingestionTopic) {
+        this.kafkaTemplate = kafkaTemplate;
+        this.ingestionTopic = ingestionTopic;
+    }
+
+    public SensorReadingResponse saveReading(SensorReadingRequest request) {
+        UUID readingId = UUID.randomUUID();
+        String sensorId = request.getSensorId() == null || request.getSensorId().isBlank()
+                ? DEFAULT_SENSOR_ID
+                : request.getSensorId();
+        Instant timestamp = request.getTimestamp() == null ? Instant.now() : request.getTimestamp();
+        Map<String, Object> parameters = request.getParameters() == null ? Collections.emptyMap() : request.getParameters();
+
+        SensorReading reading = new SensorReading(readingId, sensorId, timestamp, parameters);
+        readingsById.put(readingId, reading);
+        publishUpdate(toView(reading));
+        publishToKafka(reading, null);
+        return new SensorReadingResponse("SUCCESS", "Reading stored successfully", readingId);
+    }
+
+    public SensorReadingResponse saveRawReading(Map<String, Object> payload) {
+        UUID readingId = UUID.randomUUID();
+        String sensorId = extractSensorId(payload);
+        Instant timestamp = extractTimestamp(payload);
+        Map<String, Object> parameters = extractParameters(payload);
+
+        SensorReading reading = new SensorReading(
+                readingId,
+                sensorId,
+                timestamp,
+                parameters
+        );
+        readingsById.put(readingId, reading);
+        publishUpdate(toView(reading));
+        publishToKafka(reading, payload);
+
+        return new SensorReadingResponse("SUCCESS", "Reading stored successfully", readingId);
+    }
+
+    public List<SensorReadingResponse> saveBatch(List<SensorReadingRequest> requests) {
+        return requests.stream().map(this::saveReading).collect(Collectors.toList());
+    }
+
+    public List<SensorReadingResponse> saveRawBatch(List<Map<String, Object>> payloads) {
+        return payloads.stream().map(this::saveRawReading).collect(Collectors.toList());
+    }
+
+    public List<SensorReadingView> getReadings(String sensorId, Instant from, Instant to) {
+        return readingsById.values().stream()
+                .filter(reading -> sensorId == null || sensorId.equals(reading.getSensorId()))
+                .filter(reading -> from == null || !reading.getTimestamp().isBefore(from))
+                .filter(reading -> to == null || !reading.getTimestamp().isAfter(to))
+                .sorted(Comparator.comparing(SensorReading::getTimestamp))
+                .map(this::toView)
+                .collect(Collectors.toList());
+    }
+
+    public List<SensorReadingView> getAllReadings() {
+        return getReadings(null, null, null);
+    }
+
+    public Optional<SensorReadingView> getReadingById(UUID readingId) {
+        return Optional.ofNullable(readingsById.get(readingId)).map(this::toView);
+    }
+
+    public long getReadingCount() {
+        return readingsById.size();
+    }
+
+    public SseEmitter subscribeAllReadings() {
+        SseEmitter emitter = new SseEmitter(0L);
+        emitters.add(emitter);
+
+        emitter.onCompletion(() -> emitters.remove(emitter));
+        emitter.onTimeout(() -> emitters.remove(emitter));
+        emitter.onError(ex -> emitters.remove(emitter));
+
+        try {
+            emitter.send(SseEmitter.event()
+                    .name("snapshot")
+                    .data(getAllReadings()));
+        } catch (IOException ex) {
+            emitters.remove(emitter);
+            emitter.completeWithError(ex);
+        }
+
+        return emitter;
+    }
+
+    private SensorReadingView toView(SensorReading reading) {
+        return new SensorReadingView(
+                reading.getReadingId(),
+                reading.getSensorId(),
+                reading.getTimestamp(),
+                reading.getParameters()
+        );
+    }
+
+    private String extractSensorId(Map<String, Object> payload) {
+        Object sensorIdNode = firstPresent(payload, SENSOR_ID_KEYS);
+        if (sensorIdNode == null || String.valueOf(sensorIdNode).isBlank()) {
+            return DEFAULT_SENSOR_ID;
+        }
+        return String.valueOf(sensorIdNode);
+    }
+
+    private Instant extractTimestamp(Map<String, Object> payload) {
+        Object timestampNode = firstPresent(payload, TIMESTAMP_KEYS);
+        if (timestampNode == null) {
+            return Instant.now();
+        }
+
+        if (timestampNode instanceof Number number) {
+            return toInstantFromEpoch(number.longValue());
+        }
+
+        String value = String.valueOf(timestampNode).trim();
+        if (value.isBlank()) {
+            return Instant.now();
+        }
+
+        if (value.matches("^\\d+$")) {
+            try {
+                return toInstantFromEpoch(Long.parseLong(value));
+            } catch (NumberFormatException ex) {
+                return Instant.now();
+            }
+        }
+
+        try {
+            return Instant.parse(value);
+        } catch (DateTimeParseException ex) {
+            return Instant.now();
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> extractParameters(Map<String, Object> payload) {
+        Object parametersNode = firstPresent(payload, PARAMETERS_KEYS);
+        if (parametersNode instanceof Map<?, ?> parametersMap) {
+            return ((Map<?, ?>) parametersMap).entrySet().stream()
+                    .collect(Collectors.toMap(
+                            entry -> String.valueOf(entry.getKey()),
+                            Map.Entry::getValue
+                    ));
+        }
+        Map<String, Object> payloadMap = new HashMap<>(payload);
+        SENSOR_ID_KEYS.forEach(payloadMap::remove);
+        TIMESTAMP_KEYS.forEach(payloadMap::remove);
+        PARAMETERS_KEYS.forEach(payloadMap::remove);
+        return payloadMap;
+    }
+
+    private Object firstPresent(Map<String, Object> payload, List<String> keys) {
+        if (payload == null) {
+            return null;
+        }
+        for (String key : keys) {
+            if (payload.containsKey(key)) {
+                return payload.get(key);
+            }
+        }
+        return null;
+    }
+
+    private Instant toInstantFromEpoch(long epoch) {
+        // Heuristic: 13 digits is epoch millis; otherwise treat as epoch seconds.
+        if (Math.abs(epoch) >= 1_000_000_000_000L) {
+            return Instant.ofEpochMilli(epoch);
+        }
+        return Instant.ofEpochSecond(epoch);
+    }
+
+    private void publishUpdate(SensorReadingView readingView) {
+        List<SseEmitter> deadEmitters = new ArrayList<>();
+        for (SseEmitter emitter : emitters) {
+            System.out.println("Readings are getting Send: "+readingView+" "+"Emitter Value: "+emitter);
+            try {
+                emitter.send(SseEmitter.event()
+                        .name("update")
+                        .data(readingView));
+            } catch (IOException ex) {
+                deadEmitters.add(emitter);
+            }
+        }
+        emitters.removeAll(deadEmitters);
+    }
+
+    private void publishToKafka(SensorReading reading, @Nullable Map<String, Object> sourcePayload) {
+        if (kafkaTemplate == null) {
+            LOG.warn("KafkaTemplate bean not found. Skipping publish for reading {}", reading.getReadingId());
+            return;
+        }
+        String dataType = resolveDataType(sourcePayload, reading.getParameters());
+        System.out.println("DATA TYPE SEND: "+dataType);
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("readingId", reading.getReadingId());
+        payload.put("sensorId", reading.getSensorId());
+        payload.put("timestamp", reading.getTimestamp());
+        payload.put("parameters", reading.getParameters());
+        payload.put("dataType", dataType);
+        payload.put("data_type", dataType);
+        payload.put("sensorType", dataType);
+
+        String key = reading.getSensorId();
+        kafkaTemplate.send(ingestionTopic, key, payload).whenComplete((result, ex) -> {
+            if (ex != null) {
+                LOG.error("Failed to publish reading {} to topic {}", reading.getReadingId(), ingestionTopic, ex);
+            } else {
+                if (result != null && result.getRecordMetadata() != null) {
+                    LOG.info("Published reading {} to topic {} partition {} offset {}",
+                            reading.getReadingId(),
+                            result.getRecordMetadata().topic(),
+                            result.getRecordMetadata().partition(),
+                            result.getRecordMetadata().offset());
+                } else {
+                    LOG.info("Published reading {} to topic {}", reading.getReadingId(), ingestionTopic);
+                }
+            }
+        });
+    }
+
+    private String resolveDataType(@Nullable Map<String, Object> sourcePayload, Map<String, Object> parameters) {
+        Object payloadDataType = firstPresent(sourcePayload, DATA_TYPE_KEYS);
+        if (payloadDataType != null && !String.valueOf(payloadDataType).isBlank()) {
+            System.out.println("payload Data type: "+payloadDataType);
+            return String.valueOf(payloadDataType).trim();
+        }
+
+        Object parameterDataType = firstPresent(parameters, DATA_TYPE_KEYS);
+        if (parameterDataType != null && !String.valueOf(parameterDataType).isBlank()) {
+            return String.valueOf(parameterDataType).trim();
+        }
+
+        String inferred = inferDataTypeFromParameters(parameters);
+        if (!inferred.isBlank()) {
+            return inferred;
+        }
+
+        return "generic";
+    }
+
+    private String inferDataTypeFromParameters(Map<String, Object> parameters) {
+        if (parameters == null || parameters.isEmpty()) {
+            return "";
+        }
+
+        Set<String> keys = new HashSet<>();
+        collectNormalizedKeys(parameters, keys);
+
+        if (hasAny(keys, "tiltx", "tilty", "anglex", "angley", "tilt")) {
+            return "tiltmeter";
+        }
+        if (hasAny(keys, "inclino", "inclinometer", "inclination")) {
+            return "inclinometer";
+        }
+        if (hasAll(keys, "x", "y", "z") || hasAll(keys, "ax", "ay", "az") || hasAny(keys, "acceleration", "accelerometer")) {
+            return "accelerometer";
+        }
+        if (hasAny(keys, "amplitude", "frequency", "hz", "vibration", "rms")) {
+            return "vibration";
+        }
+        if (hasAny(keys, "force", "load", "weight", "newton")) {
+            return "loadcell";
+        }
+        if (hasAny(keys, "microstrain", "strain", "epsilon")) {
+            return "straingauge";
+        }
+        if (hasAny(keys, "crackwidth", "displacement", "distance", "crack")) {
+            return "crackmeter";
+        }
+        if (hasAny(keys, "pressure", "porepressure", "head", "waterlevel", "piezometer")) {
+            return "piezometer";
+        }
+        if (hasAny(keys, "temperature", "temp", "celsius", "fahrenheit")) {
+            return "temperature";
+        }
+
+        return "";
+    }
+
+    private void collectNormalizedKeys(Map<String, Object> map, Set<String> keys) {
+        for (Map.Entry<String, Object> entry : map.entrySet()) {
+            keys.add(normalize(entry.getKey()));
+            Object value = entry.getValue();
+            if (value instanceof Map<?, ?> nestedMap) {
+                Map<String, Object> converted = new HashMap<>();
+                for (Map.Entry<?, ?> nestedEntry : nestedMap.entrySet()) {
+                    converted.put(String.valueOf(nestedEntry.getKey()), nestedEntry.getValue());
+                }
+                collectNormalizedKeys(converted, keys);
+            }
+        }
+    }
+
+    private boolean hasAny(Set<String> keys, String... candidates) {
+        for (String candidate : candidates) {
+            String normalizedCandidate = normalize(candidate);
+            for (String key : keys) {
+                if (key.contains(normalizedCandidate)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private boolean hasAll(Set<String> keys, String... required) {
+        for (String req : required) {
+            String normalizedReq = normalize(req);
+            boolean present = false;
+            for (String key : keys) {
+                if (key.equals(normalizedReq)) {
+                    present = true;
+                    break;
+                }
+            }
+            if (!present) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private String normalize(String value) {
+        return value == null ? "" : value.replaceAll("[^a-zA-Z0-9]", "").toLowerCase(Locale.ROOT);
+    }
+}
