@@ -66,21 +66,34 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p ~/.ssh
-          if [ -z "${SSH_HOST:-}" ]; then
+          RAW_SSH_HOST="${SSH_HOST:-}"
+          if [ -z "$RAW_SSH_HOST" ]; then
             echo "SSH_HOST secret is empty or missing." >&2
             exit 1
           fi
 
-          echo "Resolving host: $SSH_HOST"
-          if ! getent hosts "$SSH_HOST"; then
-            echo "Host resolution failed for '$SSH_HOST'." >&2
+          NORMALIZED_SSH_HOST="${RAW_SSH_HOST#http://}"
+          NORMALIZED_SSH_HOST="${NORMALIZED_SSH_HOST#https://}"
+          NORMALIZED_SSH_HOST="${NORMALIZED_SSH_HOST%%/*}"
+          NORMALIZED_SSH_HOST="${NORMALIZED_SSH_HOST%%:*}"
+          NORMALIZED_SSH_HOST="$(printf '%s' "$NORMALIZED_SSH_HOST" | xargs)"
+
+          if [ -z "$NORMALIZED_SSH_HOST" ]; then
+            echo "SSH_HOST secret becomes empty after normalization." >&2
+            echo "Use only a plain public hostname or IP address in SSH_HOST." >&2
+            exit 1
+          fi
+
+          echo "Resolving normalized host derived from SSH_HOST"
+          if ! getent hosts "$NORMALIZED_SSH_HOST"; then
+            echo "Host resolution failed for the normalized SSH host value." >&2
             echo "Check the SSH_HOST GitHub secret. It must be a valid public IP address or DNS hostname." >&2
             exit 1
           fi
-          echo "Checking TCP connectivity to $SSH_HOST:$SSH_PORT"
-          nc -vz "$SSH_HOST" "$SSH_PORT"
+          echo "Checking TCP connectivity to SSH host on port $SSH_PORT"
+          nc -vz "$NORMALIZED_SSH_HOST" "$SSH_PORT"
           echo "Scanning SSH host key"
-          SSH_SCAN_OUTPUT="$(ssh-keyscan -T 20 -p "$SSH_PORT" -H "$SSH_HOST" 2>&1)"
+          SSH_SCAN_OUTPUT="$(ssh-keyscan -T 20 -p "$SSH_PORT" -H "$NORMALIZED_SSH_HOST" 2>&1)"
           printf '%s\n' "$SSH_SCAN_OUTPUT"
           printf '%s\n' "$SSH_SCAN_OUTPUT" > /tmp/backend-ssh-keyscan.log
           printf '%s\n' "$SSH_SCAN_OUTPUT" | grep -E '^(\[.*\]|[^#[:space:]]+)[[:space:]]+(ssh|ecdsa|sk-ssh)' >> ~/.ssh/known_hosts
