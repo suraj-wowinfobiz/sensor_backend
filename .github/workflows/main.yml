@@ -85,7 +85,9 @@ jobs:
           fi
 
           echo "Resolving normalized host derived from SSH_HOST"
-          if ! getent hosts "$NORMALIZED_SSH_HOST"; then
+          if [[ "$NORMALIZED_SSH_HOST" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+            echo "SSH_HOST is an IPv4 address; skipping DNS lookup."
+          elif ! getent hosts "$NORMALIZED_SSH_HOST"; then
             echo "Host resolution failed for the normalized SSH host value." >&2
             echo "Check the SSH_HOST GitHub secret. It must be a valid public IP address or DNS hostname." >&2
             exit 1
