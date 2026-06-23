@@ -1,0 +1,108 @@
+name: Deploy Backend Docker Image to Linux Server
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "src/**"
+      - "pom.xml"
+      - "mvnw"
+      - "mvnw.cmd"
+      - ".mvn/**"
+      - "Dockerfile"
+      - ".dockerignore"
+      - ".github/workflows/main.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: backend-deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      SSH_HOST: ${{ secrets.SSH_HOST }}
+      SSH_PORT: ${{ secrets.SSH_PORT || '22' }}
+      SSH_USER: ${{ secrets.SSH_USER }}
+      SSHPASS: ${{ secrets.SSH_PASSWORD }}
+      DEPLOY_PATH: ${{ secrets.DEPLOY_PATH || '/opt/sensor-backend' }}
+      IMAGE_NAME: sensor-backend
+      CONTAINER_NAME: sensor-backend
+      HOST_PORT: 8097
+      CONTAINER_PORT: 8097
+      IMAGE_TAR_NAME: sensor-backend.tar
+      REMOTE_DOCKER: ${{ secrets.REMOTE_DOCKER || 'docker' }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install sshpass
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y sshpass
+
+      - name: Build backend docker image
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE_REF="${IMAGE_NAME}:${GITHUB_SHA}"
+          docker build -t "$IMAGE_REF" .
+
+      - name: Save backend image archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          IMAGE_REF="${IMAGE_NAME}:${GITHUB_SHA}"
+          docker save "$IMAGE_REF" -o "release/${IMAGE_TAR_NAME}"
+
+      - name: Trust remote host
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          ssh-keyscan -p "$SSH_PORT" -H "$SSH_HOST" >> ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Ensure remote backend directory exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          sshpass -e ssh -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "mkdir -p '$DEPLOY_PATH'"
+
+      - name: Stop existing backend container
+        shell: bash
+        run: |
+          set -euo pipefail
+          sshpass -e ssh -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "set -e; if $REMOTE_DOCKER ps -a --format '{{.Names}}' | grep -qx '$CONTAINER_NAME'; then $REMOTE_DOCKER stop '$CONTAINER_NAME' >/dev/null 2>&1 || true; $REMOTE_DOCKER rm '$CONTAINER_NAME' >/dev/null 2>&1 || true; fi"
+
+      - name: Free backend host port
+        shell: bash
+        run: |
+          set -euo pipefail
+          sshpass -e ssh -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "set -e; PORT_CONTAINERS=\$($REMOTE_DOCKER ps -a --filter \"publish=$HOST_PORT\" --format '{{.Names}}'); for c in \$PORT_CONTAINERS; do if [ \"\$c\" != '$CONTAINER_NAME' ]; then $REMOTE_DOCKER stop \"\$c\" >/dev/null 2>&1 || true; $REMOTE_DOCKER rm \"\$c\" >/dev/null 2>&1 || true; fi; done"
+
+      - name: Upload backend image
+        shell: bash
+        run: |
+          set -euo pipefail
+          sshpass -e rsync -az -e "ssh -p $SSH_PORT" "release/${IMAGE_TAR_NAME}" "$SSH_USER@$SSH_HOST:$DEPLOY_PATH/${IMAGE_TAR_NAME}"
+
+      - name: Load new backend image and prune old tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE_REF="${IMAGE_NAME}:${GITHUB_SHA}"
+          sshpass -e ssh -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "set -e; cd '$DEPLOY_PATH'; $REMOTE_DOCKER load -i '$IMAGE_TAR_NAME'; rm -f '$IMAGE_TAR_NAME'; for img in \$($REMOTE_DOCKER images '$IMAGE_NAME' --format '{{.Repository}}:{{.Tag}}' | grep -vFx '$IMAGE_REF' || true); do $REMOTE_DOCKER rmi -f \"\$img\" >/dev/null 2>&1 || true; done"
+
+      - name: Run backend container
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE_REF="${IMAGE_NAME}:${GITHUB_SHA}"
+          sshpass -e ssh -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "set -e; cd '$DEPLOY_PATH'; $REMOTE_DOCKER run -d --name '$CONTAINER_NAME' --restart unless-stopped -p '$HOST_PORT:$CONTAINER_PORT' -e SERVER_PORT='$CONTAINER_PORT' -e SPRING_DATASOURCE_URL='${{ secrets.SPRING_DATASOURCE_URL }}' -e SPRING_DATASOURCE_USERNAME='${{ secrets.SPRING_DATASOURCE_USERNAME }}' -e SPRING_DATASOURCE_PASSWORD='${{ secrets.SPRING_DATASOURCE_PASSWORD }}' -e SECURITY_JWT_SECRET='${{ secrets.SECURITY_JWT_SECRET }}' -e KAFKA_HOST='${{ secrets.KAFKA_HOST }}' -e KAFKA_PORT='${{ secrets.KAFKA_PORT }}' '$IMAGE_REF'"

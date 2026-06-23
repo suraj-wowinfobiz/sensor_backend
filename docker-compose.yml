@@ -1,0 +1,10 @@
+services:
+  sensor-backend:
+    image: sensor-backend:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "${APP_PORT:-8097}:8097"
+    environment:
+      SERVER_PORT: 8097
