@@ -66,7 +66,15 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p ~/.ssh
-          ssh-keyscan -T 20 -p "$SSH_PORT" -H "$SSH_HOST" 2>&1 | tee /tmp/backend-ssh-keyscan.log >> ~/.ssh/known_hosts
+          echo "Resolving host: $SSH_HOST"
+          getent hosts "$SSH_HOST"
+          echo "Checking TCP connectivity to $SSH_HOST:$SSH_PORT"
+          nc -vz "$SSH_HOST" "$SSH_PORT"
+          echo "Scanning SSH host key"
+          SSH_SCAN_OUTPUT="$(ssh-keyscan -T 20 -p "$SSH_PORT" -H "$SSH_HOST" 2>&1)"
+          printf '%s\n' "$SSH_SCAN_OUTPUT"
+          printf '%s\n' "$SSH_SCAN_OUTPUT" > /tmp/backend-ssh-keyscan.log
+          printf '%s\n' "$SSH_SCAN_OUTPUT" | grep -E '^(\[.*\]|[^#[:space:]]+)[[:space:]]+(ssh|ecdsa|sk-ssh)' >> ~/.ssh/known_hosts
           test -s ~/.ssh/known_hosts
           chmod 644 ~/.ssh/known_hosts
 
