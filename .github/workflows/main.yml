@@ -66,8 +66,17 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p ~/.ssh
+          if [ -z "${SSH_HOST:-}" ]; then
+            echo "SSH_HOST secret is empty or missing." >&2
+            exit 1
+          fi
+
           echo "Resolving host: $SSH_HOST"
-          getent hosts "$SSH_HOST"
+          if ! getent hosts "$SSH_HOST"; then
+            echo "Host resolution failed for '$SSH_HOST'." >&2
+            echo "Check the SSH_HOST GitHub secret. It must be a valid public IP address or DNS hostname." >&2
+            exit 1
+          fi
           echo "Checking TCP connectivity to $SSH_HOST:$SSH_PORT"
           nc -vz "$SSH_HOST" "$SSH_PORT"
           echo "Scanning SSH host key"
