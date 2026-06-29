@@ -6,7 +6,7 @@ import java.util.List;
 import java.util.UUID;
 
 public class AccessHierarchyResponse {
-    private UUID id;
+    private UUID id; 
     private String principalType;
     private UUID principalId;
     private String name;
