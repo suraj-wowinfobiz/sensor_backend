@@ -3,6 +3,11 @@ package com.wowinfobiz.thresholdalertservice.services;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.wowinfobiz.analyticsservice.services.observer.AnalyticsEventSubject;
+import com.wowinfobiz.devicemanagmentservice.dto.SensorParameterDTO;
+import com.wowinfobiz.devicemanagmentservice.models.SensorParameterDocument;
+import com.wowinfobiz.devicemanagmentservice.models.SensorParameters;
+import com.wowinfobiz.devicemanagmentservice.repository.SensorParameterDocumentRepository;
+import com.wowinfobiz.devicemanagmentservice.repository.SensorParametersRepository;
 import com.wowinfobiz.thresholdalertservice.dto.SensorDataDTO;
 import com.wowinfobiz.thresholdalertservice.models.AlertEntity;
 import com.wowinfobiz.thresholdalertservice.models.ThresholdValueEntity;
@@ -19,7 +24,9 @@ import java.util.ArrayList;
 import java.util.Date;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicLong;
@@ -34,6 +41,12 @@ public class SensorDataProcessor {
 
     @Autowired
     private AlertRepository alertRepository;
+
+    @Autowired
+    private SensorParameterDocumentRepository sensorParameterDocumentRepository;
+
+    @Autowired
+    private SensorParametersRepository sensorParametersRepository;
 
     @Autowired
     private ObjectMapper objectMapper;
@@ -102,10 +115,7 @@ public class SensorDataProcessor {
                     continue;
                 }
                 String parameterName = entry.getKey();
-                UUID sensorParameterId = parseUuid(payload.get("sensorParameterId"), false);
-                if (sensorParameterId == null) {
-                    sensorParameterId = UUID.nameUUIDFromBytes((sensorId + ":" + parameterName).getBytes(StandardCharsets.UTF_8));
-                }
+                UUID sensorParameterId = resolveSensorParameterId(parameterName, payload.get("sensorParameterId"));
                 evaluations.add(evaluateOne(sensorId, sensorParameterId, parameterName, value));
             }
         }
@@ -149,6 +159,9 @@ public class SensorDataProcessor {
     }
 
     private AlertEntity checkThresholdAndCreateAlert(SensorDataDTO sensorData) {
+        if (sensorData.getSensorParameterId() == null) {
+            return null;
+        }
         Optional<ThresholdValueEntity> thresholdOpt = thresholdValueRepository
                 .findBySensorParameterId(sensorData.getSensorParameterId());
 
@@ -220,6 +233,69 @@ public class SensorDataProcessor {
         } catch (NumberFormatException ex) {
             return null;
         }
+    }
+
+    private UUID resolveSensorParameterId(String parameterName, Object fallbackValue) {
+        String normalizedParameter = normalizeName(parameterName);
+        if (!normalizedParameter.isBlank()) {
+            Optional<UUID> fromDocument = sensorParameterDocumentRepository.findAll().stream()
+                    .map(this::readSensorParameterDocument)
+                    .filter(Objects::nonNull)
+                    .filter(parameter -> namesMatch(parameter.getName(), parameterName, normalizedParameter))
+                    .map(SensorParameterDTO::getSensorParameterId)
+                    .filter(Objects::nonNull)
+                    .findFirst();
+            if (fromDocument.isPresent()) {
+                return fromDocument.get();
+            }
+
+            try {
+                Optional<UUID> fromEntity = sensorParametersRepository.findAll().stream()
+                        .filter(parameter -> namesMatch(parameter.getName(), parameterName, normalizedParameter))
+                        .map(SensorParameters::getSensorParameterId)
+                        .filter(Objects::nonNull)
+                        .findFirst();
+                if (fromEntity.isPresent()) {
+                    return fromEntity.get();
+                }
+            } catch (Exception ex) {
+                LOG.debug("Legacy sensor_parameter lookup skipped for {}", parameterName, ex);
+            }
+        }
+        return parseUuid(fallbackValue, false);
+    }
+
+    private SensorParameterDTO readSensorParameterDocument(SensorParameterDocument document) {
+        if (document == null || document.getData() == null || document.getData().isBlank()) {
+            return null;
+        }
+        try {
+            return objectMapper.readValue(document.getData(), SensorParameterDTO.class);
+        } catch (Exception ex) {
+            LOG.debug("Unable to read sensor parameter document {}", document.getId(), ex);
+            return null;
+        }
+    }
+
+    private boolean namesMatch(String candidate, String parameterName, String normalizedParameter) {
+        String normalizedCandidate = normalizeName(candidate);
+        if (normalizedCandidate.isBlank()) {
+            return false;
+        }
+        if (normalizedCandidate.equals(normalizedParameter)) {
+            return true;
+        }
+        String rawParameter = parameterName == null ? "" : parameterName.trim();
+        int dotIndex = rawParameter.lastIndexOf('.');
+        String leaf = dotIndex >= 0 ? rawParameter.substring(dotIndex + 1) : rawParameter;
+        return normalizedCandidate.equals(normalizeName(leaf));
+    }
+
+    private String normalizeName(String value) {
+        if (value == null) {
+            return "";
+        }
+        return value.trim().toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9]", "");
     }
 
     private Map<String, Object> collectNumericValues(Map<String, Object> source) {
