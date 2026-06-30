@@ -6,6 +6,7 @@ import com.wowinfobiz.authenticationservice.dto.UserUpdateRequest;
 import com.wowinfobiz.authenticationservice.enums.AccessPrincipalType;
 import com.wowinfobiz.authenticationservice.model.User;
 import com.wowinfobiz.authenticationservice.repo.UserRepository;
+import com.wowinfobiz.authenticationservice.repo.UserSensorAccessRepository;
 import com.wowinfobiz.authenticationservice.security.CustomUserDetails;
 import com.wowinfobiz.authenticationservice.services.AdminService;
 import com.wowinfobiz.authenticationservice.services.SuperAdminService;
@@ -37,17 +38,20 @@ public class UserController {
     private final SuperAdminService superAdminService;
     private final PasswordEncoder passwordEncoder;
     private final UserRepository userRepository;
+    private final UserSensorAccessRepository userSensorAccessRepository;
 
     public UserController(
             AdminService adminService,
             SuperAdminService superAdminService,
             PasswordEncoder passwordEncoder,
-            UserRepository userRepository
+            UserRepository userRepository,
+            UserSensorAccessRepository userSensorAccessRepository
     ) {
         this.adminService = adminService;
         this.superAdminService = superAdminService;
         this.passwordEncoder = passwordEncoder;
         this.userRepository = userRepository;
+        this.userSensorAccessRepository = userSensorAccessRepository;
     }
 
     @PreAuthorize("hasAnyRole('ADMIN','SUPER_ADMIN','VENDOR')")
@@ -182,6 +186,7 @@ public class UserController {
                     .body(new MessageResponseDTO("Forbidden", "FAILED", Collections.emptyMap()));
         }
         User user = resolveUserByScope(userId, principal);
+        userSensorAccessRepository.deleteByUserId(user.getId());
         userRepository.delete(user);
 
         Map<String, Object> body = new LinkedHashMap<>();

@@ -3,6 +3,7 @@ package com.wowinfobiz.processingservice.controller;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.wowinfobiz.analyticsservice.services.observer.AnalyticsEventSubject;
+import com.wowinfobiz.devicemanagmentservice.servicesImp.SensorEndpointSupport;
 import com.wowinfobiz.processingservice.dto.ProcessDataResponse;
 import com.wowinfobiz.processingservice.dto.SensorRawDataRequest;
 import com.wowinfobiz.processingservice.services.ProcessedReadingStoreService;
@@ -63,8 +64,9 @@ public class ProcessingController {
     private final VibrationSensor vibrationSensor;
     private final ProcessedReadingStoreService processedReadingStoreService;
     private final AnalyticsEventSubject analyticsEventSubject;
+    private final SensorEndpointSupport sensorEndpointSupport;
     private final SensorDataProcessor thresholdProcessor;
-    private final List<SseEmitter> liveEmitters = new CopyOnWriteArrayList<>();
+    private final List<LiveReadingSubscriber> liveSubscribers = new CopyOnWriteArrayList<>();
     private final AtomicLong thresholdPublishAttemptCount = new AtomicLong(0);
     private final AtomicLong thresholdPublishSuccessCount = new AtomicLong(0);
     private final AtomicLong thresholdPublishFailureCount = new AtomicLong(0);
@@ -85,6 +87,7 @@ public class ProcessingController {
                                 VibrationSensor vibrationSensor,
                                 ProcessedReadingStoreService processedReadingStoreService,
                                 AnalyticsEventSubject analyticsEventSubject,
+                                SensorEndpointSupport sensorEndpointSupport,
                                 SensorDataProcessor thresholdProcessor) {
         this.objectMapper = new ObjectMapper().findAndRegisterModules();
         this.accelerometer = accelerometer;
@@ -98,6 +101,7 @@ public class ProcessingController {
         this.vibrationSensor = vibrationSensor;
         this.processedReadingStoreService = processedReadingStoreService;
         this.analyticsEventSubject = analyticsEventSubject;
+        this.sensorEndpointSupport = sensorEndpointSupport;
         this.thresholdProcessor = thresholdProcessor;
     }
 
@@ -134,12 +138,24 @@ public class ProcessingController {
 
     @GetMapping(value = "/readings/live", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     public SseEmitter streamLiveIngestionReadings() {
-        SseEmitter emitter = new SseEmitter(0L);
-        liveEmitters.add(emitter);
+        return subscribeLiveReadings(null);
+    }
 
-        emitter.onCompletion(() -> liveEmitters.remove(emitter));
-        emitter.onTimeout(() -> liveEmitters.remove(emitter));
-        emitter.onError(ex -> liveEmitters.remove(emitter));
+    @GetMapping(value = "/readings/live/{endpointKey}", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter streamLiveSensorReadings(@PathVariable String endpointKey) {
+        SensorEndpointSupport.ResolvedSensorEndpoint resolved = sensorEndpointSupport.resolveByEndpointKey(endpointKey)
+                .orElseThrow(() -> new IllegalArgumentException("Sensor endpoint not found: " + endpointKey));
+        return subscribeLiveReadings(resolved.sensorId());
+    }
+
+    private SseEmitter subscribeLiveReadings(String sensorIdFilter) {
+        SseEmitter emitter = new SseEmitter(0L);
+        LiveReadingSubscriber subscriber = new LiveReadingSubscriber(emitter, normalizeSensorId(sensorIdFilter));
+        liveSubscribers.add(subscriber);
+
+        emitter.onCompletion(() -> liveSubscribers.remove(subscriber));
+        emitter.onTimeout(() -> liveSubscribers.remove(subscriber));
+        emitter.onError(ex -> liveSubscribers.remove(subscriber));
 
         try {
             Map<String, Object> connectedEvent = Map.of("type", "connected", "message", "Live stream connected", "data", emitter.toString());
@@ -147,7 +163,9 @@ public class ProcessingController {
             // Also send unnamed event so clients using EventSource.onmessage receive it.
             emitter.send(SseEmitter.event().data(connectedEvent));
 
-            List<Map<String, Object>> existing = processedReadingStoreService.findReadings(null, null, null);
+            List<Map<String, Object>> existing = processedReadingStoreService.findReadings(null, null, null).stream()
+                    .filter(record -> matchesSensor(subscriber.sensorIdFilter(), valueAsString(record.get("sensorId"))))
+                    .toList();
             Map<String, Object> snapshotEvent = new LinkedHashMap<>();
             snapshotEvent.put("type", "snapshot");
             snapshotEvent.put("count", existing.size());
@@ -155,7 +173,7 @@ public class ProcessingController {
             emitter.send(SseEmitter.event().name("snapshot").data(snapshotEvent));
             emitter.send(SseEmitter.event().data(snapshotEvent));
         } catch (IOException ex) {
-            liveEmitters.remove(emitter);
+            liveSubscribers.remove(subscriber);
             emitter.completeWithError(ex);
         }
 
@@ -176,7 +194,7 @@ public class ProcessingController {
     public ResponseEntity<?> runtimeStatus() {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("mode", "direct-websocket-sse");
-        body.put("liveSubscribers", liveEmitters.size());
+        body.put("liveSubscribers", liveSubscribers.size());
         body.put("thresholdPublishAttemptCount", thresholdPublishAttemptCount.get());
         body.put("thresholdPublishSuccessCount", thresholdPublishSuccessCount.get());
         body.put("thresholdPublishFailureCount", thresholdPublishFailureCount.get());
@@ -296,7 +314,7 @@ public class ProcessingController {
     private void broadcastLiveUpdate(SensorRawDataRequest<?> request,
                                      ProcessDataResponse<?> response,
                                      Map<String, Object> rawPayload) {
-        if (liveEmitters.isEmpty()) {
+        if (liveSubscribers.isEmpty()) {
             return;
         }
 
@@ -309,17 +327,20 @@ public class ProcessingController {
         event.put("processedPayload", response.getBody());
         event.put("processedStatus", response.isStatus());
 
-        List<SseEmitter> deadEmitters = new ArrayList<>();
-        for (SseEmitter emitter : liveEmitters) {
+        List<LiveReadingSubscriber> deadSubscribers = new ArrayList<>();
+        for (LiveReadingSubscriber subscriber : liveSubscribers) {
+            if (!matchesSensor(subscriber.sensorIdFilter(), request.getSensorId() == null ? null : request.getSensorId().toString())) {
+                continue;
+            }
             try {
-                emitter.send(SseEmitter.event().name("reading").data(event));
+                subscriber.emitter().send(SseEmitter.event().name("reading").data(event));
                 // Also emit unnamed event for generic onmessage listeners.
-                emitter.send(SseEmitter.event().data(event));
+                subscriber.emitter().send(SseEmitter.event().data(event));
             } catch (IOException ex) {
-                deadEmitters.add(emitter);
+                deadSubscribers.add(subscriber);
             }
         }
-        liveEmitters.removeAll(deadEmitters);
+        liveSubscribers.removeAll(deadSubscribers);
     }
 
     private ProcessDataResponse<?> processByDataType(SensorRawDataRequest<?> request) {
@@ -614,5 +635,22 @@ public class ProcessingController {
 
     private Map<String, Object> copyPayload(Map<String, Object> payload) {
         return payload == null ? Map.of() : new LinkedHashMap<>(payload);
+    }
+
+    private boolean matchesSensor(String expectedSensorId, String actualSensorId) {
+        return expectedSensorId == null
+                || expectedSensorId.isBlank()
+                || expectedSensorId.equals(normalizeSensorId(actualSensorId));
+    }
+
+    private String normalizeSensorId(String sensorId) {
+        return sensorId == null ? null : sensorId.trim();
+    }
+
+    private String valueAsString(Object value) {
+        return value == null ? "" : String.valueOf(value).trim();
+    }
+
+    private record LiveReadingSubscriber(SseEmitter emitter, String sensorIdFilter) {
     }
 }

@@ -1,8 +1,6 @@
 package com.wowinfobiz.devicemanagmentservice.services;
 
 import com.wowinfobiz.devicemanagmentservice.dto.SensorDTO;
-import com.wowinfobiz.devicemanagmentservice.models.SensorDocument;
-import com.wowinfobiz.devicemanagmentservice.models.SensorsEntity;
 
 import java.util.List;
 import java.util.UUID;
@@ -10,9 +8,11 @@ import java.util.UUID;
 public interface SensorService {
     SensorDTO createSensor(UUID deviceId, SensorDTO request);
 
-    List<SensorDocument> getAllSensors();
+    List<SensorDTO> getAllSensors();
 
     SensorDTO getSensor(UUID sensorId);
+
+    SensorDTO getSensorByEndpointKey(String endpointKey);
 
     List<SensorDTO> getSensorsByDevice(UUID deviceId);
 

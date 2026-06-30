@@ -11,6 +11,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.CopyOnWriteArrayList;
 
 @Component
@@ -18,7 +19,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 public class LiveAnalyticsObserver implements AnalyticsEventObserver {
     private static final Logger LOG = LoggerFactory.getLogger(LiveAnalyticsObserver.class);
 
-    private final List<SseEmitter> emitters = new CopyOnWriteArrayList<>();
+    private final List<AnalyticsSubscriber> subscribers = new CopyOnWriteArrayList<>();
     private final AnalyticsEventCache analyticsEventCache;
 
     public LiveAnalyticsObserver(AnalyticsEventCache analyticsEventCache) {
@@ -26,19 +27,24 @@ public class LiveAnalyticsObserver implements AnalyticsEventObserver {
     }
 
     public SseEmitter subscribe() {
+        return subscribe(null);
+    }
+
+    public SseEmitter subscribe(String sensorIdFilter) {
         SseEmitter emitter = new SseEmitter(0L);
-        emitters.add(emitter);
-        emitter.onCompletion(() -> emitters.remove(emitter));
-        emitter.onTimeout(() -> emitters.remove(emitter));
-        emitter.onError(ex -> emitters.remove(emitter));
+        AnalyticsSubscriber subscriber = new AnalyticsSubscriber(emitter, normalizeSensorId(sensorIdFilter));
+        subscribers.add(subscriber);
+        emitter.onCompletion(() -> subscribers.remove(subscriber));
+        emitter.onTimeout(() -> subscribers.remove(subscriber));
+        emitter.onError(ex -> subscribers.remove(subscriber));
         try {
             emitter.send(SseEmitter.event().name("connected").data(Map.of("message", "Analytics live stream connected")));
             Map<String, Object> lastEvent = analyticsEventCache.getLastEvent();
-            if (!lastEvent.isEmpty()) {
+            if (!lastEvent.isEmpty() && matchesSensor(subscriber.sensorIdFilter(), valueAsString(lastEvent.get("sensorId")))) {
                 emitter.send(toChartPayload(lastEvent));
             }
         } catch (Exception ex) {
-            emitters.remove(emitter);
+            subscribers.remove(subscriber);
             emitter.completeWithError(ex);
         }
         return emitter;
@@ -46,23 +52,27 @@ public class LiveAnalyticsObserver implements AnalyticsEventObserver {
 
     @Override
     public void onAnalyticsEvent(Map<String, Object> event) {
-        if (emitters.isEmpty()) {
+        if (subscribers.isEmpty()) {
             return;
         }
         Map<String, Object> livePayload = toChartPayload(event);
+        String sensorId = valueAsString(event == null ? null : event.get("sensorId"));
 
-        List<SseEmitter> dead = new ArrayList<>();
-        for (SseEmitter emitter : emitters) {
+        List<AnalyticsSubscriber> dead = new ArrayList<>();
+        for (AnalyticsSubscriber subscriber : subscribers) {
+            if (!matchesSensor(subscriber.sensorIdFilter(), sensorId)) {
+                continue;
+            }
             try {
                 // Send as default SSE message event for broad client compatibility.
-                emitter.send(livePayload);
+                subscriber.emitter().send(livePayload);
             } catch (Exception ex) {
-                dead.add(emitter);
+                dead.add(subscriber);
             }
         }
-        emitters.removeAll(dead);
+        subscribers.removeAll(dead);
         if (!dead.isEmpty()) {
-            LOG.debug("Removed {} dead analytics live emitters; active={}", dead.size(), emitters.size());
+            LOG.debug("Removed {} dead analytics live emitters; active={}", dead.size(), subscribers.size());
         }
     }
 
@@ -116,5 +126,22 @@ public class LiveAnalyticsObserver implements AnalyticsEventObserver {
         } catch (Exception ex) {
             return Instant.now().toEpochMilli();
         }
+    }
+
+    private boolean matchesSensor(String expectedSensorId, String actualSensorId) {
+        return expectedSensorId == null
+                || expectedSensorId.isBlank()
+                || Objects.equals(expectedSensorId, normalizeSensorId(actualSensorId));
+    }
+
+    private String normalizeSensorId(String sensorId) {
+        return sensorId == null ? null : sensorId.trim();
+    }
+
+    private String valueAsString(Object value) {
+        return value == null ? "" : String.valueOf(value).trim();
+    }
+
+    private record AnalyticsSubscriber(SseEmitter emitter, String sensorIdFilter) {
     }
 }

@@ -1,8 +1,6 @@
 package com.wowinfobiz.devicemanagmentservice.controller;
 
 import com.wowinfobiz.devicemanagmentservice.dto.SensorDTO;
-import com.wowinfobiz.devicemanagmentservice.models.SensorDocument;
-import com.wowinfobiz.devicemanagmentservice.models.SensorsEntity;
 import com.wowinfobiz.devicemanagmentservice.services.SensorService;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -29,7 +27,7 @@ public class SensorController {
     }
 
     @GetMapping("/get-all")
-    public ResponseEntity<List<SensorDocument>> getAllSensors(){
+    public ResponseEntity<List<SensorDTO>> getAllSensors(){
         return  ResponseEntity.status(HttpStatus.ACCEPTED).body(sensorService.getAllSensors());
     }
 

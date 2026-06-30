@@ -2,6 +2,7 @@ package com.wowinfobiz.analyticsservice.controllers;
 
 import com.wowinfobiz.analyticsservice.services.AnalyticsEventStore;
 import com.wowinfobiz.analyticsservice.services.observer.LiveAnalyticsObserver;
+import com.wowinfobiz.devicemanagmentservice.servicesImp.SensorEndpointSupport;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -22,11 +23,14 @@ import java.util.Map;
 public class AnlyticsController {
     private final AnalyticsEventStore eventStore;
     private final LiveAnalyticsObserver liveAnalyticsObserver;
+    private final SensorEndpointSupport sensorEndpointSupport;
 
     public AnlyticsController(AnalyticsEventStore eventStore,
-                              LiveAnalyticsObserver liveAnalyticsObserver) {
+                              LiveAnalyticsObserver liveAnalyticsObserver,
+                              SensorEndpointSupport sensorEndpointSupport) {
         this.eventStore = eventStore;
         this.liveAnalyticsObserver = liveAnalyticsObserver;
+        this.sensorEndpointSupport = sensorEndpointSupport;
     }
 
     @GetMapping("/events")
@@ -37,6 +41,13 @@ public class AnlyticsController {
     @GetMapping(value = "/events/live", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     public SseEmitter streamEvents() {
         return liveAnalyticsObserver.subscribe();
+    }
+
+    @GetMapping(value = "/events/live/{endpointKey}", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter streamSensorEvents(@PathVariable String endpointKey) {
+        SensorEndpointSupport.ResolvedSensorEndpoint resolved = sensorEndpointSupport.resolveByEndpointKey(endpointKey)
+                .orElseThrow(() -> new IllegalArgumentException("Sensor endpoint not found: " + endpointKey));
+        return liveAnalyticsObserver.subscribe(resolved.sensorId());
     }
 
     @GetMapping("/events/recent")

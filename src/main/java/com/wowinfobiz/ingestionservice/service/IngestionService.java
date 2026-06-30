@@ -31,7 +31,7 @@ public class IngestionService {
     private static final List<String> DATA_TYPE_KEYS = List.of("dataType", "data_type", "sensorType", "sensor_type", "type");
 
     private final Map<UUID, SensorReading> readingsById = new ConcurrentHashMap<>();
-    private final List<SseEmitter> emitters = new CopyOnWriteArrayList<>();
+    private final List<ReadingSubscriber> subscribers = new CopyOnWriteArrayList<>();
     private final ObjectProvider<ProcessingController> processingControllerProvider;
     private final boolean directProcessingEnabled;
 
@@ -108,19 +108,24 @@ public class IngestionService {
     }
 
     public SseEmitter subscribeAllReadings() {
-        SseEmitter emitter = new SseEmitter(0L);
-        emitters.add(emitter);
+        return subscribeReadings(null);
+    }
 
-        emitter.onCompletion(() -> emitters.remove(emitter));
-        emitter.onTimeout(() -> emitters.remove(emitter));
-        emitter.onError(ex -> emitters.remove(emitter));
+    public SseEmitter subscribeReadings(String sensorIdFilter) {
+        SseEmitter emitter = new SseEmitter(0L);
+        ReadingSubscriber subscriber = new ReadingSubscriber(emitter, normalizeSensorId(sensorIdFilter));
+        subscribers.add(subscriber);
+
+        emitter.onCompletion(() -> subscribers.remove(subscriber));
+        emitter.onTimeout(() -> subscribers.remove(subscriber));
+        emitter.onError(ex -> subscribers.remove(subscriber));
 
         try {
             emitter.send(SseEmitter.event()
                     .name("snapshot")
-                    .data(getAllReadings()));
+                    .data(getReadings(subscriber.sensorIdFilter(), null, null)));
         } catch (IOException ex) {
-            emitters.remove(emitter);
+            subscribers.remove(subscriber);
             emitter.completeWithError(ex);
         }
 
@@ -212,18 +217,20 @@ public class IngestionService {
     }
 
     private void publishUpdate(SensorReadingView readingView) {
-        List<SseEmitter> deadEmitters = new ArrayList<>();
-        for (SseEmitter emitter : emitters) {
-            System.out.println("Readings are getting Send: "+readingView+" "+"Emitter Value: "+emitter);
+        List<ReadingSubscriber> deadSubscribers = new ArrayList<>();
+        for (ReadingSubscriber subscriber : subscribers) {
+            if (!matchesSensor(subscriber.sensorIdFilter(), readingView.getSensorId())) {
+                continue;
+            }
             try {
-                emitter.send(SseEmitter.event()
+                subscriber.emitter().send(SseEmitter.event()
                         .name("update")
                         .data(readingView));
             } catch (IOException ex) {
-                deadEmitters.add(emitter);
+                deadSubscribers.add(subscriber);
             }
         }
-        emitters.removeAll(deadEmitters);
+        subscribers.removeAll(deadSubscribers);
     }
 
     private Map<String, Object> buildProcessingPayload(SensorReading reading, Map<String, Object> sourcePayload) {
@@ -360,5 +367,18 @@ public class IngestionService {
 
     private String normalize(String value) {
         return value == null ? "" : value.replaceAll("[^a-zA-Z0-9]", "").toLowerCase(Locale.ROOT);
+    }
+
+    private boolean matchesSensor(String expectedSensorId, String actualSensorId) {
+        return expectedSensorId == null
+                || expectedSensorId.isBlank()
+                || Objects.equals(expectedSensorId, normalizeSensorId(actualSensorId));
+    }
+
+    private String normalizeSensorId(String sensorId) {
+        return sensorId == null ? null : sensorId.trim();
+    }
+
+    private record ReadingSubscriber(SseEmitter emitter, String sensorIdFilter) {
     }
 }
