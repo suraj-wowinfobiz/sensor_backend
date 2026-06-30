@@ -10,7 +10,9 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.server.ResponseStatusException;
 
 import java.time.Instant;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 
 
@@ -129,10 +131,30 @@ public class SensorServiceImp implements SensorService {
     }
 
     private String normalizeEndpointUid(String endpointUid, UUID sensorId) {
-        if (endpointUid != null && endpointUid.matches("\\d{5}")) {
+        if (endpointUid != null && endpointUid.matches("\\d{6}")) {
             return endpointUid;
         }
-        int value = Math.abs(sensorId.toString().hashCode()) % 100000;
-        return String.format("%05d", value);
+        return generateUniqueEndpointUid(sensorId);
+    }
+
+    private String generateUniqueEndpointUid(UUID sensorId) {
+        int baseValue = Math.abs(sensorId.toString().hashCode()) % 1_000_000;
+        Set<String> usedUids = new HashSet<>();
+        for (SensorDocument document : sensorRepository.findAll()) {
+            SensorDTO sensor = sensorEndpointSupport.mapDocument(document);
+            if (sensor.getEndpointUid() != null && sensor.getEndpointUid().matches("\\d{6}")) {
+                usedUids.add(sensor.getEndpointUid());
+            }
+        }
+
+        for (int offset = 0; offset < 1_000_000; offset++) {
+            int value = (baseValue + offset) % 1_000_000;
+            String candidate = String.format("%06d", value);
+            if (!usedUids.contains(candidate)) {
+                return candidate;
+            }
+        }
+
+        throw new ResponseStatusException(HttpStatus.CONFLICT, "Unable to allocate unique endpoint UID");
     }
 }

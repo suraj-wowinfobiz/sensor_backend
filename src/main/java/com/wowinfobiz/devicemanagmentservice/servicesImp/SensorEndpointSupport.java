@@ -79,9 +79,9 @@ public class SensorEndpointSupport {
         String endpointUid = normalizeUid(sensor.getEndpointUid(), sensor.getSensorId());
         sensor.setEndpointUid(endpointUid);
 
-        String sensorLabel = firstNonBlank(sensor.getName(), sensor.getSerialNumber(), "sensor");
         String deviceLabel = deviceDisplayName(device);
-        String endpointKey = endpointUid + "-" + slugify(sensorLabel) + "-" + slugify(deviceLabel);
+        String sensorLabel = slugify(firstNonBlank(sensor.getName(), sensor.getSerialNumber(), ""));
+        String endpointKey = sensorLabel.isBlank() ? endpointUid : endpointUid + "-" + sensorLabel;
 
         sensor.setDeviceName(deviceLabel);
         sensor.setEndpointKey(endpointKey);
@@ -110,16 +110,11 @@ public class SensorEndpointSupport {
     }
 
     private String normalizeUid(String existingUid, UUID sensorId) {
-        if (existingUid != null && existingUid.matches("\\d{5}")) {
+        if (existingUid != null && existingUid.matches("\\d{6}")) {
             return existingUid;
         }
-        int value = Math.abs(sensorId.toString().hashCode()) % 100000;
-        return String.format("%05d", value);
-    }
-
-    private String slugify(String value) {
-        String normalized = normalizeSegment(value);
-        return normalized.isBlank() ? "item" : normalized;
+        int value = Math.abs(sensorId.toString().hashCode()) % 1_000_000;
+        return String.format("%06d", value);
     }
 
     private String normalizeSegment(String value) {
@@ -132,6 +127,10 @@ public class SensorEndpointSupport {
                 .replaceAll("^-+", "")
                 .replaceAll("-+$", "")
                 .replaceAll("-{2,}", "-");
+    }
+
+    private String slugify(String value) {
+        return normalizeSegment(value);
     }
 
     private String firstNonBlank(String... values) {
