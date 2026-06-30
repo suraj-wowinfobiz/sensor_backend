@@ -1,6 +1,7 @@
 package com.wowinfobiz.ingestionservice.controller;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.wowinfobiz.authenticationservice.security.LiveEndpointAccessService;
 import com.wowinfobiz.devicemanagmentservice.servicesImp.SensorEndpointSupport;
 import com.wowinfobiz.ingestionservice.dto.SensorReadingResponse;
 import com.wowinfobiz.ingestionservice.dto.SensorReadingView;
@@ -43,12 +44,15 @@ public class IngestionController {
 
     private final IngestionService ingestionService;
     private final SensorEndpointSupport sensorEndpointSupport;
+    private final LiveEndpointAccessService liveEndpointAccessService;
     private final ObjectMapper objectMapper = new ObjectMapper().findAndRegisterModules();
 
     public IngestionController(IngestionService ingestionService,
-                               SensorEndpointSupport sensorEndpointSupport) {
+                               SensorEndpointSupport sensorEndpointSupport,
+                               LiveEndpointAccessService liveEndpointAccessService) {
         this.ingestionService = ingestionService;
         this.sensorEndpointSupport = sensorEndpointSupport;
+        this.liveEndpointAccessService = liveEndpointAccessService;
     }
 
 
@@ -59,12 +63,17 @@ public class IngestionController {
     )
     public ResponseEntity<SensorReadingResponse> ingestReadingAlias(@RequestBody(required = false) String rawBody,
                                                                     @RequestParam MultiValueMap<String, String> queryParams,
+                                                                    @RequestParam String userId,
                                                                     @RequestHeader(value = HttpHeaders.CONTENT_TYPE, required = false) String contentType) {
+        liveEndpointAccessService.requireUser(userId);
         LOG.info("Ingestion POST received: contentType={}, rawBodyLength={}, queryParamKeys={}",
                 contentType,
                 rawBody == null ? 0 : rawBody.length(),
                 queryParams == null ? List.of() : queryParams.keySet());
         Map<String, Object> payload = parseInboundPayload(rawBody, queryParams);
+        if (!payload.isEmpty()) {
+            payload.remove("userId");
+        }
         if (payload.isEmpty()) {
             LOG.warn("Ingestion POST rejected: unable to parse payload");
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
@@ -81,11 +90,16 @@ public class IngestionController {
     public ResponseEntity<SensorReadingResponse> ingestReadingForSensorEndpoint(@PathVariable String endpointKey,
                                                                                 @RequestBody(required = false) String rawBody,
                                                                                 @RequestParam MultiValueMap<String, String> queryParams,
+                                                                                @RequestParam String userId,
                                                                                 @RequestHeader(value = HttpHeaders.CONTENT_TYPE, required = false) String contentType) {
         SensorEndpointSupport.ResolvedSensorEndpoint resolved = sensorEndpointSupport.resolveByEndpointKey(endpointKey)
                 .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Sensor endpoint not found"));
+        liveEndpointAccessService.requireUserForSensor(userId, resolved.sensorId());
 
         Map<String, Object> payload = parseInboundPayload(rawBody, queryParams);
+        if (!payload.isEmpty()) {
+            payload.remove("userId");
+        }
         if (payload.isEmpty()) {
             LOG.warn("Sensor endpoint ingestion rejected: endpointKey={}, unable to parse payload", endpointKey);
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
@@ -111,6 +125,54 @@ public class IngestionController {
         return ResponseEntity.status(HttpStatus.CREATED).body(ingestionService.saveRawReading(enriched));
     }
 
+    @PostMapping(
+            value = "/{endpointKey}/{userId}",
+            consumes = {MediaType.APPLICATION_JSON_VALUE, MediaType.TEXT_PLAIN_VALUE, MediaType.APPLICATION_FORM_URLENCODED_VALUE, MediaType.ALL_VALUE}
+    )
+    public ResponseEntity<SensorReadingResponse> ingestReadingForSensorEndpointWithUser(@PathVariable String endpointKey,
+                                                                                        @PathVariable String userId,
+                                                                                        @RequestBody(required = false) String rawBody,
+                                                                                        @RequestParam MultiValueMap<String, String> queryParams,
+                                                                                        @RequestHeader(value = HttpHeaders.CONTENT_TYPE, required = false) String contentType) {
+        SensorEndpointSupport.ResolvedSensorEndpoint resolved = sensorEndpointSupport.resolveByEndpointKey(endpointKey)
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Sensor endpoint not found"));
+        liveEndpointAccessService.requireUserForSensor(
+                userId,
+                resolved.sensorId(),
+                resolved.device().getSiteId(),
+                resolved.device().getZoneId()
+        );
+
+        Map<String, Object> payload = parseInboundPayload(rawBody, queryParams);
+        if (!payload.isEmpty()) {
+            payload.remove("userId");
+        }
+        if (payload.isEmpty()) {
+            LOG.warn("Sensor endpoint ingestion rejected: endpointKey={}, unable to parse payload", endpointKey);
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                    "Unable to parse ingestion payload. Provide JSON object, form data, query params, or key=value body");
+        }
+
+        Map<String, Object> enriched = new LinkedHashMap<>(payload);
+        enriched.put("sensorId", resolved.sensorId());
+        enriched.put("sensorName", resolved.sensorName());
+        enriched.put("deviceName", resolved.deviceName());
+        if (resolved.sensor().getSensorTypeId() != null) {
+            enriched.put("sensorTypeId", resolved.sensor().getSensorTypeId().toString());
+        }
+        if (StringUtils.hasText(resolved.sensorName())) {
+            enriched.putIfAbsent("dataType", resolved.sensorName());
+        }
+
+        LOG.info("Ingestion sensor endpoint POST received: endpointKey={}, userId={}, sensorId={}, contentType={}, keys={}",
+                endpointKey,
+                userId,
+                resolved.sensorId(),
+                contentType,
+                enriched.keySet());
+        return ResponseEntity.status(HttpStatus.CREATED).body(ingestionService.saveRawReading(enriched));
+    }
+
 
     @GetMapping("/readings")
     public ResponseEntity<List<SensorReadingView>> getReadings(
@@ -127,14 +189,36 @@ public class IngestionController {
     }
 
     @GetMapping(value = "/readings/live", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-    public SseEmitter streamAllReadings() {
+    public SseEmitter streamAllReadings(@RequestParam String userId) {
+        liveEndpointAccessService.requireUser(userId);
         return ingestionService.subscribeAllReadings();
     }
 
     @GetMapping(value = "/readings/live/{endpointKey}", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-    public SseEmitter streamSensorReadings(@PathVariable String endpointKey) {
+    public SseEmitter streamSensorReadings(@PathVariable String endpointKey,
+                                           @RequestParam String userId) {
         SensorEndpointSupport.ResolvedSensorEndpoint resolved = sensorEndpointSupport.resolveByEndpointKey(endpointKey)
                 .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Sensor endpoint not found"));
+        liveEndpointAccessService.requireUserForSensor(
+                userId,
+                resolved.sensorId(),
+                resolved.device().getSiteId(),
+                resolved.device().getZoneId()
+        );
+        return ingestionService.subscribeReadings(resolved.sensorId());
+    }
+
+    @GetMapping(value = "/readings/live/{endpointKey}/{userId}", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter streamSensorReadingsWithUserPath(@PathVariable String endpointKey,
+                                                       @PathVariable String userId) {
+        SensorEndpointSupport.ResolvedSensorEndpoint resolved = sensorEndpointSupport.resolveByEndpointKey(endpointKey)
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Sensor endpoint not found"));
+        liveEndpointAccessService.requireUserForSensor(
+                userId,
+                resolved.sensorId(),
+                resolved.device().getSiteId(),
+                resolved.device().getZoneId()
+        );
         return ingestionService.subscribeReadings(resolved.sensorId());
     }
 

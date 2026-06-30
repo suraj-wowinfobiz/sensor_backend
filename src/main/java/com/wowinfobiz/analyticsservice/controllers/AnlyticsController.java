@@ -2,6 +2,7 @@ package com.wowinfobiz.analyticsservice.controllers;
 
 import com.wowinfobiz.analyticsservice.services.AnalyticsEventStore;
 import com.wowinfobiz.analyticsservice.services.observer.LiveAnalyticsObserver;
+import com.wowinfobiz.authenticationservice.security.LiveEndpointAccessService;
 import com.wowinfobiz.devicemanagmentservice.servicesImp.SensorEndpointSupport;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -24,13 +25,16 @@ public class AnlyticsController {
     private final AnalyticsEventStore eventStore;
     private final LiveAnalyticsObserver liveAnalyticsObserver;
     private final SensorEndpointSupport sensorEndpointSupport;
+    private final LiveEndpointAccessService liveEndpointAccessService;
 
     public AnlyticsController(AnalyticsEventStore eventStore,
                               LiveAnalyticsObserver liveAnalyticsObserver,
-                              SensorEndpointSupport sensorEndpointSupport) {
+                              SensorEndpointSupport sensorEndpointSupport,
+                              LiveEndpointAccessService liveEndpointAccessService) {
         this.eventStore = eventStore;
         this.liveAnalyticsObserver = liveAnalyticsObserver;
         this.sensorEndpointSupport = sensorEndpointSupport;
+        this.liveEndpointAccessService = liveEndpointAccessService;
     }
 
     @GetMapping("/events")
@@ -39,14 +43,36 @@ public class AnlyticsController {
     }
 
     @GetMapping(value = "/events/live", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-    public SseEmitter streamEvents() {
+    public SseEmitter streamEvents(@RequestParam String userId) {
+        liveEndpointAccessService.requireUser(userId);
         return liveAnalyticsObserver.subscribe();
     }
 
     @GetMapping(value = "/events/live/{endpointKey}", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-    public SseEmitter streamSensorEvents(@PathVariable String endpointKey) {
+    public SseEmitter streamSensorEvents(@PathVariable String endpointKey,
+                                         @RequestParam String userId) {
         SensorEndpointSupport.ResolvedSensorEndpoint resolved = sensorEndpointSupport.resolveByEndpointKey(endpointKey)
                 .orElseThrow(() -> new IllegalArgumentException("Sensor endpoint not found: " + endpointKey));
+        liveEndpointAccessService.requireUserForSensor(
+                userId,
+                resolved.sensorId(),
+                resolved.device().getSiteId(),
+                resolved.device().getZoneId()
+        );
+        return liveAnalyticsObserver.subscribe(resolved.sensorId());
+    }
+
+    @GetMapping(value = "/events/live/{endpointKey}/{userId}", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter streamSensorEventsWithUserPath(@PathVariable String endpointKey,
+                                                     @PathVariable String userId) {
+        SensorEndpointSupport.ResolvedSensorEndpoint resolved = sensorEndpointSupport.resolveByEndpointKey(endpointKey)
+                .orElseThrow(() -> new IllegalArgumentException("Sensor endpoint not found: " + endpointKey));
+        liveEndpointAccessService.requireUserForSensor(
+                userId,
+                resolved.sensorId(),
+                resolved.device().getSiteId(),
+                resolved.device().getZoneId()
+        );
         return liveAnalyticsObserver.subscribe(resolved.sensorId());
     }
 

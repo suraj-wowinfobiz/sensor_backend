@@ -11,6 +11,18 @@ import java.util.Optional;
 import java.util.UUID;
 
 public interface SiteZoneAccessRepository extends JpaRepository<SiteZoneAccess, UUID> {
+    boolean existsByPrincipalTypeAndPrincipalIdAndSiteId(
+            AccessPrincipalType principalType,
+            UUID principalId,
+            UUID siteId
+    );
+
+    boolean existsByPrincipalTypeAndPrincipalIdAndZoneId(
+            AccessPrincipalType principalType,
+            UUID principalId,
+            UUID zoneId
+    );
+
     List<SiteZoneAccess> findByAssignedByTypeAndAssignedById(
             AccessPrincipalType assignedByType,
             UUID assignedById

@@ -3,6 +3,7 @@ package com.wowinfobiz.processingservice.controller;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.wowinfobiz.analyticsservice.services.observer.AnalyticsEventSubject;
+import com.wowinfobiz.authenticationservice.security.LiveEndpointAccessService;
 import com.wowinfobiz.devicemanagmentservice.servicesImp.SensorEndpointSupport;
 import com.wowinfobiz.processingservice.dto.ProcessDataResponse;
 import com.wowinfobiz.processingservice.dto.SensorRawDataRequest;
@@ -65,6 +66,7 @@ public class ProcessingController {
     private final ProcessedReadingStoreService processedReadingStoreService;
     private final AnalyticsEventSubject analyticsEventSubject;
     private final SensorEndpointSupport sensorEndpointSupport;
+    private final LiveEndpointAccessService liveEndpointAccessService;
     private final SensorDataProcessor thresholdProcessor;
     private final List<LiveReadingSubscriber> liveSubscribers = new CopyOnWriteArrayList<>();
     private final AtomicLong thresholdPublishAttemptCount = new AtomicLong(0);
@@ -88,6 +90,7 @@ public class ProcessingController {
                                 ProcessedReadingStoreService processedReadingStoreService,
                                 AnalyticsEventSubject analyticsEventSubject,
                                 SensorEndpointSupport sensorEndpointSupport,
+                                LiveEndpointAccessService liveEndpointAccessService,
                                 SensorDataProcessor thresholdProcessor) {
         this.objectMapper = new ObjectMapper().findAndRegisterModules();
         this.accelerometer = accelerometer;
@@ -102,6 +105,7 @@ public class ProcessingController {
         this.processedReadingStoreService = processedReadingStoreService;
         this.analyticsEventSubject = analyticsEventSubject;
         this.sensorEndpointSupport = sensorEndpointSupport;
+        this.liveEndpointAccessService = liveEndpointAccessService;
         this.thresholdProcessor = thresholdProcessor;
     }
 
@@ -137,14 +141,36 @@ public class ProcessingController {
     }
 
     @GetMapping(value = "/readings/live", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-    public SseEmitter streamLiveIngestionReadings() {
+    public SseEmitter streamLiveIngestionReadings(@RequestParam String userId) {
+        liveEndpointAccessService.requireUser(userId);
         return subscribeLiveReadings(null);
     }
 
     @GetMapping(value = "/readings/live/{endpointKey}", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
-    public SseEmitter streamLiveSensorReadings(@PathVariable String endpointKey) {
+    public SseEmitter streamLiveSensorReadings(@PathVariable String endpointKey,
+                                               @RequestParam String userId) {
         SensorEndpointSupport.ResolvedSensorEndpoint resolved = sensorEndpointSupport.resolveByEndpointKey(endpointKey)
                 .orElseThrow(() -> new IllegalArgumentException("Sensor endpoint not found: " + endpointKey));
+        liveEndpointAccessService.requireUserForSensor(
+                userId,
+                resolved.sensorId(),
+                resolved.device().getSiteId(),
+                resolved.device().getZoneId()
+        );
+        return subscribeLiveReadings(resolved.sensorId());
+    }
+
+    @GetMapping(value = "/readings/live/{endpointKey}/{userId}", produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    public SseEmitter streamLiveSensorReadingsWithUserPath(@PathVariable String endpointKey,
+                                                           @PathVariable String userId) {
+        SensorEndpointSupport.ResolvedSensorEndpoint resolved = sensorEndpointSupport.resolveByEndpointKey(endpointKey)
+                .orElseThrow(() -> new IllegalArgumentException("Sensor endpoint not found: " + endpointKey));
+        liveEndpointAccessService.requireUserForSensor(
+                userId,
+                resolved.sensorId(),
+                resolved.device().getSiteId(),
+                resolved.device().getZoneId()
+        );
         return subscribeLiveReadings(resolved.sensorId());
     }
 

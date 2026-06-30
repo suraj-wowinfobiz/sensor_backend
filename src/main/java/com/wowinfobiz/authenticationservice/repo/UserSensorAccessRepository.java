@@ -9,5 +9,7 @@ import java.util.UUID;
 public interface UserSensorAccessRepository extends JpaRepository<UserSensorAccess, UUID> {
     List<UserSensorAccess> findByUserId(UUID userId);
 
+    boolean existsByUserIdAndSensorId(UUID userId, UUID sensorId);
+
     void deleteByUserId(UUID userId);
 }
