@@ -53,10 +53,6 @@
             <artifactId>spring-boot-starter-mail</artifactId>
         </dependency>
         <dependency>
-            <groupId>org.springframework.kafka</groupId>
-            <artifactId>spring-kafka</artifactId>
-        </dependency>
-        <dependency>
             <groupId>io.jsonwebtoken</groupId>
             <artifactId>jjwt-api</artifactId>
             <version>${jjwt.version}</version>
@@ -94,11 +90,6 @@
             <artifactId>spring-boot-starter-test</artifactId>
             <scope>test</scope>
         </dependency>
-        <dependency>
-            <groupId>org.springframework.kafka</groupId>
-            <artifactId>spring-kafka-test</artifactId>
-            <scope>test</scope>
-        </dependency>
     </dependencies>
 
     <build>
@@ -118,10 +109,6 @@
                         <exclude>**/ConfigurationServiceApplication.java</exclude>
                         <exclude>**/ThresholdAlertServiceApplication.java</exclude>
                         <exclude>**/authenticationservice/security/SecurityConfig.java</exclude>
-                        <exclude>**/ingestionservice/config/KafkaConfig.java</exclude>
-                        <exclude>**/processingservice/config/KafkaConfig.java</exclude>
-                        <exclude>**/analyticsservice/config/KafkaConfig.java</exclude>
-                        <exclude>**/thresholdalertservice/kafka/KafkaConfig.java</exclude>
                         <exclude>**/thresholdalertservice/config/AppConfig.java</exclude>
                     </excludes>
                 </configuration>

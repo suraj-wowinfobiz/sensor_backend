@@ -15,22 +15,10 @@ import com.wowinfobiz.processingservice.services.sensors.StrainGuage;
 import com.wowinfobiz.processingservice.services.sensors.TempratorSensor;
 import com.wowinfobiz.processingservice.services.sensors.TiltMeter;
 import com.wowinfobiz.processingservice.services.sensors.VibrationSensor;
-import org.apache.kafka.clients.consumer.ConsumerConfig;
-import org.apache.kafka.clients.consumer.ConsumerRecord;
-import org.apache.kafka.clients.consumer.ConsumerRecords;
-import org.apache.kafka.clients.consumer.KafkaConsumer;
-import org.apache.kafka.common.PartitionInfo;
-import org.apache.kafka.common.TopicPartition;
-import org.apache.kafka.common.serialization.ByteArrayDeserializer;
-import org.apache.kafka.common.serialization.StringDeserializer;
+import com.wowinfobiz.thresholdalertservice.services.SensorDataProcessor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.ResponseEntity;
-import org.springframework.kafka.annotation.KafkaListener;
-import org.springframework.kafka.core.KafkaTemplate;
-import org.springframework.lang.Nullable;
-import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.http.MediaType;
 import org.springframework.util.StringUtils;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -42,8 +30,6 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
-import jakarta.annotation.PostConstruct;
-import jakarta.annotation.PreDestroy;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
@@ -53,15 +39,11 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
-import java.util.Properties;
-import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.time.Duration;
 
 @RestController
 @RequestMapping("/api/v1/processing")
@@ -70,8 +52,6 @@ public class ProcessingController {
     private static final Logger LOG = LoggerFactory.getLogger(ProcessingController.class);
 
     private final ObjectMapper objectMapper;
-    @Nullable
-    private final KafkaTemplate<Object, Object> kafkaTemplate;
     private final Accelerometer accelerometer;
     private final CrackMeter crackMeter;
     private final InclinoMeter inclinoMeter;
@@ -83,57 +63,18 @@ public class ProcessingController {
     private final VibrationSensor vibrationSensor;
     private final ProcessedReadingStoreService processedReadingStoreService;
     private final AnalyticsEventSubject analyticsEventSubject;
+    private final SensorDataProcessor thresholdProcessor;
     private final List<SseEmitter> liveEmitters = new CopyOnWriteArrayList<>();
-    private final AtomicLong kafkaConsumedCount = new AtomicLong(0);
     private final AtomicLong thresholdPublishAttemptCount = new AtomicLong(0);
     private final AtomicLong thresholdPublishSuccessCount = new AtomicLong(0);
     private final AtomicLong thresholdPublishFailureCount = new AtomicLong(0);
-    private final AtomicLong manualConsumerInstanceCounter = new AtomicLong(0);
-    private volatile Instant lastKafkaMessageAt;
     private volatile Instant lastThresholdPublishAt;
     private volatile Instant lastThresholdPublishSuccessAt;
     private volatile Instant lastThresholdPublishFailureAt;
     private volatile String lastThresholdPublishError;
     private volatile Map<String, Object> lastThresholdPayloadSummary = Map.of();
-    private final Object manualConsumerLock = new Object();
-    @Nullable
-    private volatile KafkaConsumer<String, byte[]> manualPollingConsumer;
 
-    @Value("${spring.kafka.bootstrap-servers}")
-    private String bootstrapServers;
-
-    @Value("${app.kafka.topics.ingestion}")
-    private String ingestionTopic;
-
-    @Value("${spring.kafka.consumer.group-id:processing-service-group}")
-    private String consumerGroupId;
-
-    @Value("${app.kafka.topics.threshold}")
-    private String thresholdTopic;
-
-    @Value("${app.kafka.listener.enabled:false}")
-    private boolean kafkaListenerEnabled;
-
-    @Value("${app.kafka.manual-polling.enabled:false}")
-    private boolean manualPollingEnabled;
-
-    @Value("${app.kafka.manual-polling.poll-timeout-ms:3000}")
-    private long manualPollingTimeoutMs;
-
-    @Value("${app.kafka.manual-polling.max-records:200}")
-    private int manualPollingMaxRecords;
-
-    @Value("${app.kafka.manual-polling.startup-replay-enabled:false}")
-    private boolean manualPollingStartupReplayEnabled;
-
-    @Value("${app.kafka.manual-polling.startup-replay-records:500}")
-    private int manualPollingStartupReplayRecords;
-
-    private volatile List<String> assignedIngestionPartitions = List.of();
-    private final AtomicBoolean startupReplayApplied = new AtomicBoolean(false);
-
-    public ProcessingController(@Nullable KafkaTemplate<Object, Object> kafkaTemplate,
-                                Accelerometer accelerometer,
+    public ProcessingController(Accelerometer accelerometer,
                                 CrackMeter crackMeter,
                                 InclinoMeter inclinoMeter,
                                 LoadCellSensor loadCellSensor,
@@ -143,9 +84,9 @@ public class ProcessingController {
                                 TiltMeter tiltMeter,
                                 VibrationSensor vibrationSensor,
                                 ProcessedReadingStoreService processedReadingStoreService,
-                                AnalyticsEventSubject analyticsEventSubject) {
+                                AnalyticsEventSubject analyticsEventSubject,
+                                SensorDataProcessor thresholdProcessor) {
         this.objectMapper = new ObjectMapper().findAndRegisterModules();
-        this.kafkaTemplate = kafkaTemplate;
         this.accelerometer = accelerometer;
         this.crackMeter = crackMeter;
         this.inclinoMeter = inclinoMeter;
@@ -157,12 +98,7 @@ public class ProcessingController {
         this.vibrationSensor = vibrationSensor;
         this.processedReadingStoreService = processedReadingStoreService;
         this.analyticsEventSubject = analyticsEventSubject;
-    }
-
-    @PostConstruct
-    public void logKafkaRuntimeConfig() {
-        LOG.info("Processing Kafka config => bootstrapServers={}, ingestionTopic={}, consumerGroupId={}, thresholdTopic={}, listenerEnabled={}, manualPollingEnabled={}",
-                bootstrapServers, ingestionTopic, consumerGroupId, thresholdTopic, kafkaListenerEnabled, manualPollingEnabled);
+        this.thresholdProcessor = thresholdProcessor;
     }
 
     @PostMapping("/process")
@@ -236,25 +172,26 @@ public class ProcessingController {
         return ResponseEntity.ok(new ProcessDataResponse<>("Processed reading fetched successfully", true, record.get()));
     }
 
-    @GetMapping("/kafka/status")
-    public ResponseEntity<?> kafkaStatus() {
+    @GetMapping("/runtime/status")
+    public ResponseEntity<?> runtimeStatus() {
         Map<String, Object> body = new LinkedHashMap<>();
-        body.put("bootstrapServers", bootstrapServers);
-        body.put("ingestionTopic", ingestionTopic);
-        body.put("consumerGroupId", consumerGroupId);
-        body.put("listenerEnabled", kafkaListenerEnabled);
-        body.put("manualPollingEnabled", manualPollingEnabled);
-        body.put("assignedIngestionPartitions", assignedIngestionPartitions);
-        body.put("consumedCount", kafkaConsumedCount.get());
-        body.put("lastKafkaMessageAt", lastKafkaMessageAt);
-        return ResponseEntity.ok(new ProcessDataResponse<>("Kafka listener status fetched", true, body));
+        body.put("mode", "direct-websocket-sse");
+        body.put("liveSubscribers", liveEmitters.size());
+        body.put("thresholdPublishAttemptCount", thresholdPublishAttemptCount.get());
+        body.put("thresholdPublishSuccessCount", thresholdPublishSuccessCount.get());
+        body.put("thresholdPublishFailureCount", thresholdPublishFailureCount.get());
+        body.put("lastThresholdPublishAt", lastThresholdPublishAt);
+        body.put("lastThresholdPublishSuccessAt", lastThresholdPublishSuccessAt);
+        body.put("lastThresholdPublishFailureAt", lastThresholdPublishFailureAt);
+        body.put("lastThresholdPublishError", lastThresholdPublishError);
+        body.put("lastThresholdPayloadSummary", lastThresholdPayloadSummary);
+        return ResponseEntity.ok(new ProcessDataResponse<>("Processing runtime status fetched", true, body));
     }
 
-    @GetMapping("/kafka/threshold-publish-status")
+    @GetMapping("/runtime/threshold-status")
     public ResponseEntity<?> thresholdPublishStatus() {
         Map<String, Object> body = new LinkedHashMap<>();
-        body.put("bootstrapServers", bootstrapServers);
-        body.put("thresholdTopic", thresholdTopic);
+        body.put("mode", "direct-websocket-sse");
         body.put("publishAttemptCount", thresholdPublishAttemptCount.get());
         body.put("publishSuccessCount", thresholdPublishSuccessCount.get());
         body.put("publishFailureCount", thresholdPublishFailureCount.get());
@@ -264,81 +201,6 @@ public class ProcessingController {
         body.put("lastThresholdPublishError", lastThresholdPublishError);
         body.put("lastThresholdPayloadSummary", lastThresholdPayloadSummary);
         return ResponseEntity.ok(new ProcessDataResponse<>("Threshold publish status fetched", true, body));
-    }
-
-    @GetMapping("/kafka/probe")
-    public ResponseEntity<?> kafkaProbe(@RequestParam(name = "timeoutMs", defaultValue = "3000") long timeoutMs,
-                                        @RequestParam(name = "maxRecords", defaultValue = "5") int maxRecords) {
-        Properties props = new Properties();
-        props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
-        props.put(ConsumerConfig.GROUP_ID_CONFIG, "processing-probe-" + UUID.randomUUID());
-        props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
-        props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
-        props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, ByteArrayDeserializer.class.getName());
-
-        List<Map<String, Object>> samples = new ArrayList<>();
-        List<Map<String, Object>> partitions = new ArrayList<>();
-        int totalPolled = 0;
-        int pollAttempts = 0;
-        Map<String, Object> partitionOffsets = new LinkedHashMap<>();
-
-        try (KafkaConsumer<String, byte[]> consumer = new KafkaConsumer<>(props)) {
-            List<PartitionInfo> partitionInfos = consumer.partitionsFor(ingestionTopic, Duration.ofMillis(1000));
-            for (PartitionInfo info : partitionInfos) {
-                Map<String, Object> partition = new LinkedHashMap<>();
-                partition.put("topic", info.topic());
-                partition.put("partition", info.partition());
-                partition.put("leader", info.leader() == null ? null : info.leader().idString());
-                partitions.add(partition);
-            }
-            Set<TopicPartition> assigned = partitionInfos.stream()
-                    .map(info -> new TopicPartition(info.topic(), info.partition()))
-                    .collect(java.util.stream.Collectors.toSet());
-            consumer.assign(new ArrayList<>(assigned));
-
-            if (!assigned.isEmpty()) {
-                Map<TopicPartition, Long> beginning = consumer.beginningOffsets(assigned);
-                Map<TopicPartition, Long> end = consumer.endOffsets(assigned);
-                for (TopicPartition tp : assigned) {
-                    Map<String, Object> off = new LinkedHashMap<>();
-                    off.put("beginningOffset", beginning.get(tp));
-                    off.put("endOffset", end.get(tp));
-                    partitionOffsets.put(tp.topic() + "-" + tp.partition(), off);
-                }
-                consumer.seekToBeginning(assigned);
-            }
-
-            long deadline = System.currentTimeMillis() + timeoutMs;
-            while (System.currentTimeMillis() < deadline && samples.size() < maxRecords) {
-                ConsumerRecords<String, byte[]> records = consumer.poll(Duration.ofMillis(500));
-                pollAttempts++;
-                totalPolled += records.count();
-
-                for (ConsumerRecord<String, byte[]> record : records) {
-                    if (samples.size() >= maxRecords) {
-                        break;
-                    }
-                    Map<String, Object> sample = new LinkedHashMap<>();
-                    sample.put("topic", record.topic());
-                    sample.put("partition", record.partition());
-                    sample.put("offset", record.offset());
-                    sample.put("key", record.key());
-                    sample.put("value", record.value() == null ? null : new String(record.value(), StandardCharsets.UTF_8));
-                    samples.add(sample);
-                }
-            }
-        }
-
-        Map<String, Object> body = new LinkedHashMap<>();
-        body.put("bootstrapServers", bootstrapServers);
-        body.put("ingestionTopic", ingestionTopic);
-        body.put("timeoutMs", timeoutMs);
-        body.put("pollAttempts", pollAttempts);
-        body.put("totalPolled", totalPolled);
-        body.put("partitions", partitions);
-        body.put("partitionOffsets", partitionOffsets);
-        body.put("samples", samples);
-        return ResponseEntity.ok(new ProcessDataResponse<>("Kafka probe completed", true, body));
     }
 
     @PostMapping("/recalculate/{readingId}")
@@ -394,142 +256,6 @@ public class ProcessingController {
         body.put("failedReadingIds", failedReadingIds);
 
         return ResponseEntity.ok(new ProcessDataResponse<>("Batch recalculation completed", true, body));
-    }
-
-    @KafkaListener(
-            id = "ingestion-topic-listener",
-            groupId = "${spring.kafka.consumer.group-id}",
-            topics = "${app.kafka.topics.ingestion}",
-            properties = {"auto.offset.reset=earliest"},
-            containerFactory = "kafkaListenerContainerFactory",
-            autoStartup = "${app.kafka.listener.enabled:false}"
-    )
-    public void consumeIngestionData(byte[] payloadBytes) {
-        String payloadJson = payloadBytes == null ? "" : new String(payloadBytes, StandardCharsets.UTF_8);
-        processKafkaPayload(payloadJson);
-    }
-
-    @Scheduled(
-            initialDelayString = "${app.kafka.manual-polling.initial-delay-ms:5000}",
-            fixedDelayString = "${app.kafka.manual-polling.fixed-delay-ms:3000}"
-    )
-    public void consumeIngestionDataByPolling() {
-        if (!manualPollingEnabled) {
-            return;
-        }
-
-        int processed = 0;
-        try {
-            KafkaConsumer<String, byte[]> consumer = getOrCreateManualPollingConsumer();
-            ConsumerRecords<String, byte[]> records = consumer.poll(Duration.ofMillis(manualPollingTimeoutMs));
-            if (records.isEmpty()) {
-                return;
-            }
-
-            for (ConsumerRecord<String, byte[]> record : records) {
-                String payloadJson = record.value() == null ? "" : new String(record.value(), StandardCharsets.UTF_8);
-                processKafkaPayload(payloadJson);
-                processed++;
-            }
-            LOG.info("Manual Kafka polling processed {} records from topic {}", processed, ingestionTopic);
-        } catch (Exception ex) {
-            LOG.warn("Manual Kafka polling failed for topic {} using bootstrapServers={}", ingestionTopic, bootstrapServers, ex);
-            resetManualPollingConsumer();
-        }
-    }
-
-    private KafkaConsumer<String, byte[]> getOrCreateManualPollingConsumer() {
-        synchronized (manualConsumerLock) {
-            if (manualPollingConsumer != null) {
-                return manualPollingConsumer;
-            }
-
-            Properties props = new Properties();
-            props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
-            props.put(ConsumerConfig.GROUP_ID_CONFIG, consumerGroupId);
-            props.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
-            props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class.getName());
-            props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, ByteArrayDeserializer.class.getName());
-            props.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, true);
-            props.put(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, manualPollingMaxRecords);
-            long consumerInstance = manualConsumerInstanceCounter.incrementAndGet();
-            String manualConsumerClientId = "processing-manual-poller-" + consumerInstance;
-            props.put(ConsumerConfig.CLIENT_ID_CONFIG, manualConsumerClientId);
-            props.put(ConsumerConfig.REQUEST_TIMEOUT_MS_CONFIG, 10000);
-            props.put(ConsumerConfig.DEFAULT_API_TIMEOUT_MS_CONFIG, 60000);
-
-            KafkaConsumer<String, byte[]> consumer = new KafkaConsumer<>(props);
-            List<PartitionInfo> partitionInfos = consumer.partitionsFor(ingestionTopic, Duration.ofMillis(2000));
-            if (partitionInfos == null || partitionInfos.isEmpty()) {
-                consumer.close(Duration.ofSeconds(1));
-                assignedIngestionPartitions = List.of();
-                throw new IllegalStateException("No partitions found for ingestion topic " + ingestionTopic);
-            }
-
-            List<TopicPartition> topicPartitions = partitionInfos.stream()
-                    .map(info -> new TopicPartition(info.topic(), info.partition()))
-                    .toList();
-            consumer.assign(topicPartitions);
-            assignedIngestionPartitions = topicPartitions.stream()
-                    .map(tp -> tp.topic() + "-" + tp.partition())
-                    .toList();
-
-            if (manualPollingStartupReplayEnabled && startupReplayApplied.compareAndSet(false, true)) {
-                Map<TopicPartition, Long> endOffsets = consumer.endOffsets(Set.copyOf(topicPartitions));
-                long replayCount = Math.max(1, manualPollingStartupReplayRecords);
-                for (TopicPartition tp : topicPartitions) {
-                    long end = endOffsets.getOrDefault(tp, 0L);
-                    long start = Math.max(0L, end - replayCount);
-                    consumer.seek(tp, start);
-                }
-                LOG.info("Manual Kafka startup replay enabled for {} partitions, replay records per partition={}",
-                        topicPartitions.size(), replayCount);
-            } else {
-                consumer.seekToEnd(topicPartitions);
-                LOG.info("Manual Kafka startup replay disabled. Starting from latest offsets for partitions={}",
-                        assignedIngestionPartitions);
-            }
-
-            manualPollingConsumer = consumer;
-            LOG.info("Manual Kafka poller started. bootstrapServers={}, topic={}, groupId={}, clientId={}, partitions={}",
-                    bootstrapServers, ingestionTopic, consumerGroupId, manualConsumerClientId, assignedIngestionPartitions);
-            return consumer;
-        }
-    }
-
-    private void resetManualPollingConsumer() {
-        synchronized (manualConsumerLock) {
-            if (manualPollingConsumer == null) {
-                return;
-            }
-            try {
-                manualPollingConsumer.close(Duration.ofSeconds(2));
-            } catch (Exception ignored) {
-                // no-op
-            }
-            manualPollingConsumer = null;
-            assignedIngestionPartitions = List.of();
-        }
-    }
-
-    @PreDestroy
-    public void shutdownManualPollingConsumer() {
-        resetManualPollingConsumer();
-    }
-
-    private void processKafkaPayload(String payloadJson) {
-        try {
-            LOG.debug("Received ingestion payload from Kafka: {}", payloadJson);
-            kafkaConsumedCount.incrementAndGet();
-            lastKafkaMessageAt = Instant.now();
-            Map<String, Object> payload = objectMapper.readValue(payloadJson, new TypeReference<>() {
-            });
-            SensorRawDataRequest<?> request = toRequest(payload);
-            ProcessDataResponse<?> response = processByDataType(request);
-            persistAndPublishParallel(request, response, copyPayload(payload));
-        } catch (Exception ex) {
-            LOG.error("Failed to process ingestion payload: {}", payloadJson, ex);
-        }
     }
 
     private void persistAndPublishParallel(SensorRawDataRequest<?> request,
@@ -644,28 +370,21 @@ public class ProcessingController {
 
 
     private void publishToThreshold(SensorRawDataRequest<?> request, ProcessDataResponse<?> response) {
-        if (kafkaTemplate == null) {
-            LOG.warn("KafkaTemplate bean not found. Skipping publish for reading {}", request.getReadingId());
-            return;
-        }
-        String key = request.getSensorId() == null ? null : request.getSensorId().toString();
         Map<String, Object> thresholdPayload = buildThresholdPayload(request, response);
         thresholdPublishAttemptCount.incrementAndGet();
         lastThresholdPublishAt = Instant.now();
         lastThresholdPayloadSummary = summarizeThresholdPayload(thresholdPayload);
-        kafkaTemplate.send(thresholdTopic, key, thresholdPayload).whenComplete((result, ex) -> {
-            if (ex != null) {
-                thresholdPublishFailureCount.incrementAndGet();
-                lastThresholdPublishFailureAt = Instant.now();
-                lastThresholdPublishError = ex.getMessage();
-                LOG.error("Failed to publish processed reading {} to topic {}", request.getReadingId(), thresholdTopic, ex);
-            } else {
-                thresholdPublishSuccessCount.incrementAndGet();
-                lastThresholdPublishSuccessAt = Instant.now();
-                lastThresholdPublishError = null;
-                LOG.info("Published processed reading {} to topic {}", request.getReadingId(), thresholdTopic);
-            }
-        });
+        try {
+            thresholdProcessor.processLivePayload(thresholdPayload);
+            thresholdPublishSuccessCount.incrementAndGet();
+            lastThresholdPublishSuccessAt = Instant.now();
+            lastThresholdPublishError = null;
+        } catch (Exception ex) {
+            thresholdPublishFailureCount.incrementAndGet();
+            lastThresholdPublishFailureAt = Instant.now();
+            lastThresholdPublishError = ex.getMessage();
+            LOG.error("Failed to process threshold checks for reading {}", request.getReadingId(), ex);
+        }
     }
 
     private Map<String, Object> summarizeThresholdPayload(Map<String, Object> payload) {

@@ -1,6 +1,5 @@
 package com.wowinfobiz.analyticsservice.controllers;
 
-import com.wowinfobiz.analyticsservice.kafka.AnalyticsKafkaConsumer;
 import com.wowinfobiz.analyticsservice.services.AnalyticsEventStore;
 import com.wowinfobiz.analyticsservice.services.observer.LiveAnalyticsObserver;
 import org.springframework.http.MediaType;
@@ -23,14 +22,11 @@ import java.util.Map;
 public class AnlyticsController {
     private final AnalyticsEventStore eventStore;
     private final LiveAnalyticsObserver liveAnalyticsObserver;
-    private final AnalyticsKafkaConsumer analyticsKafkaConsumer;
 
     public AnlyticsController(AnalyticsEventStore eventStore,
-                              LiveAnalyticsObserver liveAnalyticsObserver,
-                              AnalyticsKafkaConsumer analyticsKafkaConsumer) {
+                              LiveAnalyticsObserver liveAnalyticsObserver) {
         this.eventStore = eventStore;
         this.liveAnalyticsObserver = liveAnalyticsObserver;
-        this.analyticsKafkaConsumer = analyticsKafkaConsumer;
     }
 
     @GetMapping("/events")
@@ -53,9 +49,13 @@ public class AnlyticsController {
         return ResponseEntity.ok(eventStore.getAlertEvents());
     }
 
-    @GetMapping("/kafka/status")
-    public ResponseEntity<Map<String, Object>> getKafkaStatus() {
-        return ResponseEntity.ok(analyticsKafkaConsumer.kafkaIngestionStatus());
+    @GetMapping("/runtime/status")
+    public ResponseEntity<Map<String, Object>> getRuntimeStatus() {
+        Map<String, Object> status = new LinkedHashMap<>();
+        status.put("mode", "direct-websocket-sse");
+        status.put("totalEvents", eventStore.count());
+        status.put("liveEndpoint", "/api/v1/analytics/events/live");
+        return ResponseEntity.ok(status);
     }
 
     @GetMapping("/dashboard/summary")

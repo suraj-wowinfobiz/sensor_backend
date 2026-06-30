@@ -9,8 +9,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.kafka.core.KafkaTemplate;
-import org.springframework.lang.Nullable;
 import org.springframework.stereotype.Service;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
@@ -34,19 +32,12 @@ public class IngestionService {
 
     private final Map<UUID, SensorReading> readingsById = new ConcurrentHashMap<>();
     private final List<SseEmitter> emitters = new CopyOnWriteArrayList<>();
-    @Nullable
-    private final KafkaTemplate<Object, Object> kafkaTemplate;
     private final ObjectProvider<ProcessingController> processingControllerProvider;
-    private final String ingestionTopic;
     private final boolean directProcessingEnabled;
 
-    public IngestionService(@Nullable KafkaTemplate<Object, Object> kafkaTemplate,
-                            ObjectProvider<ProcessingController> processingControllerProvider,
-                            @Value("${app.kafka.topics.ingestion}") String ingestionTopic,
+    public IngestionService(ObjectProvider<ProcessingController> processingControllerProvider,
                             @Value("${app.ingestion.direct-processing.enabled:true}") boolean directProcessingEnabled) {
-        this.kafkaTemplate = kafkaTemplate;
         this.processingControllerProvider = processingControllerProvider;
-        this.ingestionTopic = ingestionTopic;
         this.directProcessingEnabled = directProcessingEnabled;
     }
 
@@ -63,7 +54,6 @@ public class IngestionService {
         publishUpdate(toView(reading));
         Map<String, Object> processingPayload = buildProcessingPayload(reading, null);
         processDirectly(processingPayload);
-        publishToKafka(reading, null);
         return new SensorReadingResponse("SUCCESS", "Reading stored successfully", readingId);
     }
 
@@ -83,7 +73,6 @@ public class IngestionService {
         publishUpdate(toView(reading));
         Map<String, Object> processingPayload = buildProcessingPayload(reading, payload);
         processDirectly(processingPayload);
-        publishToKafka(reading, payload);
 
         return new SensorReadingResponse("SUCCESS", "Reading stored successfully", readingId);
     }
@@ -237,31 +226,7 @@ public class IngestionService {
         emitters.removeAll(deadEmitters);
     }
 
-    private void publishToKafka(SensorReading reading, @Nullable Map<String, Object> sourcePayload) {
-        if (kafkaTemplate == null) {
-            LOG.warn("KafkaTemplate bean not found. Skipping publish for reading {}", reading.getReadingId());
-            return;
-        }
-        Map<String, Object> payload = buildProcessingPayload(reading, sourcePayload);
-        String key = reading.getSensorId();
-        kafkaTemplate.send(ingestionTopic, key, payload).whenComplete((result, ex) -> {
-            if (ex != null) {
-                LOG.error("Failed to publish reading {} to topic {}", reading.getReadingId(), ingestionTopic, ex);
-            } else {
-                if (result != null && result.getRecordMetadata() != null) {
-                    LOG.info("Published reading {} to topic {} partition {} offset {}",
-                            reading.getReadingId(),
-                            result.getRecordMetadata().topic(),
-                            result.getRecordMetadata().partition(),
-                            result.getRecordMetadata().offset());
-                } else {
-                    LOG.info("Published reading {} to topic {}", reading.getReadingId(), ingestionTopic);
-                }
-            }
-        });
-    }
-
-    private Map<String, Object> buildProcessingPayload(SensorReading reading, @Nullable Map<String, Object> sourcePayload) {
+    private Map<String, Object> buildProcessingPayload(SensorReading reading, Map<String, Object> sourcePayload) {
         String dataType = resolveDataType(sourcePayload, reading.getParameters());
         System.out.println("DATA TYPE SEND: "+dataType);
         Map<String, Object> payload = new LinkedHashMap<>();
@@ -291,7 +256,7 @@ public class IngestionService {
         }
     }
 
-    private String resolveDataType(@Nullable Map<String, Object> sourcePayload, Map<String, Object> parameters) {
+    private String resolveDataType(Map<String, Object> sourcePayload, Map<String, Object> parameters) {
         Object payloadDataType = firstPresent(sourcePayload, DATA_TYPE_KEYS);
         if (payloadDataType != null && !String.valueOf(payloadDataType).isBlank()) {
             System.out.println("payload Data type: "+payloadDataType);
