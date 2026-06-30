@@ -2,6 +2,7 @@ package com.wowinfobiz.processingservice.controller;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.wowinfobiz.analyticsservice.services.observer.AnalyticsEventSubject;
 import com.wowinfobiz.processingservice.dto.ProcessDataResponse;
 import com.wowinfobiz.processingservice.dto.SensorRawDataRequest;
 import com.wowinfobiz.processingservice.services.ProcessedReadingStoreService;
@@ -81,6 +82,7 @@ public class ProcessingController {
     private final TiltMeter tiltMeter;
     private final VibrationSensor vibrationSensor;
     private final ProcessedReadingStoreService processedReadingStoreService;
+    private final AnalyticsEventSubject analyticsEventSubject;
     private final List<SseEmitter> liveEmitters = new CopyOnWriteArrayList<>();
     private final AtomicLong kafkaConsumedCount = new AtomicLong(0);
     private final AtomicLong thresholdPublishAttemptCount = new AtomicLong(0);
@@ -112,7 +114,7 @@ public class ProcessingController {
     @Value("${app.kafka.listener.enabled:false}")
     private boolean kafkaListenerEnabled;
 
-    @Value("${app.kafka.manual-polling.enabled:true}")
+    @Value("${app.kafka.manual-polling.enabled:false}")
     private boolean manualPollingEnabled;
 
     @Value("${app.kafka.manual-polling.poll-timeout-ms:3000}")
@@ -121,7 +123,7 @@ public class ProcessingController {
     @Value("${app.kafka.manual-polling.max-records:200}")
     private int manualPollingMaxRecords;
 
-    @Value("${app.kafka.manual-polling.startup-replay-enabled:true}")
+    @Value("${app.kafka.manual-polling.startup-replay-enabled:false}")
     private boolean manualPollingStartupReplayEnabled;
 
     @Value("${app.kafka.manual-polling.startup-replay-records:500}")
@@ -140,7 +142,8 @@ public class ProcessingController {
                                 TempratorSensor tempratorSensor,
                                 TiltMeter tiltMeter,
                                 VibrationSensor vibrationSensor,
-                                ProcessedReadingStoreService processedReadingStoreService) {
+                                ProcessedReadingStoreService processedReadingStoreService,
+                                AnalyticsEventSubject analyticsEventSubject) {
         this.objectMapper = new ObjectMapper().findAndRegisterModules();
         this.kafkaTemplate = kafkaTemplate;
         this.accelerometer = accelerometer;
@@ -153,6 +156,7 @@ public class ProcessingController {
         this.tiltMeter = tiltMeter;
         this.vibrationSensor = vibrationSensor;
         this.processedReadingStoreService = processedReadingStoreService;
+        this.analyticsEventSubject = analyticsEventSubject;
     }
 
     @PostConstruct
@@ -163,10 +167,14 @@ public class ProcessingController {
 
     @PostMapping("/process")
     public ResponseEntity<?> processSensor(@RequestBody Map<String, Object> payload) {
+        return ResponseEntity.ok(processPayload(payload));
+    }
+
+    public ProcessDataResponse<?> processPayload(Map<String, Object> payload) {
         SensorRawDataRequest<?> request = toRequest(payload);
         ProcessDataResponse<?> response = processByDataType(request);
         persistAndPublishParallel(request, response, copyPayload(payload));
-        return ResponseEntity.ok(response);
+        return response;
     }
 
     @GetMapping({"/readings"})
@@ -511,7 +519,7 @@ public class ProcessingController {
 
     private void processKafkaPayload(String payloadJson) {
         try {
-            LOG.info("Received ingestion payload from Kafka: {}", payloadJson);
+            LOG.debug("Received ingestion payload from Kafka: {}", payloadJson);
             kafkaConsumedCount.incrementAndGet();
             lastKafkaMessageAt = Instant.now();
             Map<String, Object> payload = objectMapper.readValue(payloadJson, new TypeReference<>() {
@@ -529,7 +537,7 @@ public class ProcessingController {
                                            Map<String, Object> rawPayload) {
         CompletableFuture<Void> saveFuture = CompletableFuture.runAsync(() -> {
             processedReadingStoreService.save(request, response, rawPayload);
-            LOG.info("Stored processed reading {} in date-wise CSV", request.getReadingId());
+            LOG.debug("Stored processed reading {} in date-wise CSV", request.getReadingId());
         });
 
         CompletableFuture<Void> publishFuture = CompletableFuture.runAsync(() -> publishToThreshold(request, response));
@@ -545,6 +553,7 @@ public class ProcessingController {
         }
 
         broadcastLiveUpdate(request, response, rawPayload);
+        publishAnalyticsLiveEvent(request, response, rawPayload);
     }
 
     private Throwable waitForFuture(CompletableFuture<Void> future) {
@@ -686,6 +695,72 @@ public class ProcessingController {
         payload.put("processedBody", safeBody(response));
         payload.put("calculatedValues", extractNumericValues(safeBody(response)));
         return payload;
+    }
+
+    private void publishAnalyticsLiveEvent(SensorRawDataRequest<?> request,
+                                           ProcessDataResponse<?> response,
+                                           Map<String, Object> rawPayload) {
+        try {
+            Map<String, Object> thresholdPayload = buildThresholdPayload(request, response);
+            Map<String, Object> calculatedValues = thresholdPayload.get("calculatedValues") instanceof Map<?, ?> map
+                    ? objectMapper.convertValue(map, new TypeReference<>() {
+            })
+                    : collectNumericValues(safeBody(response));
+
+            List<Map<String, Object>> evaluations = new ArrayList<>();
+            for (Map.Entry<String, Object> entry : calculatedValues.entrySet()) {
+                if (!(entry.getValue() instanceof Number number)) {
+                    continue;
+                }
+                Map<String, Object> evaluation = new LinkedHashMap<>();
+                evaluation.put("parameterName", entry.getKey());
+                evaluation.put("value", number.doubleValue());
+                evaluation.put("alertCreated", false);
+                evaluations.add(evaluation);
+            }
+
+            Map<String, Object> event = new LinkedHashMap<>();
+            event.put("sensorId", request.getSensorId());
+            event.put("readingId", request.getReadingId());
+            event.put("timestamp", request.getTimestamp() == null ? Instant.now() : request.getTimestamp());
+            event.put("dataType", request.getDataType());
+            event.put("evaluations", evaluations);
+            event.put("alertCount", 0);
+            event.put("source", "processing-service");
+            event.put("rawPayload", rawPayload);
+            event.put("processedPayload", response.getBody());
+
+            analyticsEventSubject.publish(event);
+        } catch (Exception ex) {
+            LOG.warn("Failed to publish analytics live event for reading {}", request.getReadingId(), ex);
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> collectNumericValues(Map<String, Object> source) {
+        Map<String, Object> values = new LinkedHashMap<>();
+        flattenNumericValues("", source == null ? Map.of() : source, values);
+        return values;
+    }
+
+    private void flattenNumericValues(String prefix, Object value, Map<String, Object> target) {
+        if (value instanceof Number number) {
+            target.put(prefix.isEmpty() ? "value" : prefix, number.doubleValue());
+            return;
+        }
+        if (value instanceof Map<?, ?> map) {
+            for (Map.Entry<?, ?> entry : map.entrySet()) {
+                String key = String.valueOf(entry.getKey());
+                String next = prefix.isEmpty() ? key : prefix + "." + key;
+                flattenNumericValues(next, entry.getValue(), target);
+            }
+            return;
+        }
+        if (value instanceof List<?> list) {
+            for (int i = 0; i < list.size(); i++) {
+                flattenNumericValues(prefix + "[" + i + "]", list.get(i), target);
+            }
+        }
     }
 
     private Map<String, Object> extractNumericValues(Map<String, Object> source) {

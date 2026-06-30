@@ -84,7 +84,7 @@ public class SensorDataConsumer {
     @Value("${spring.kafka.consumer.auto-offset-reset:earliest}")
     private String autoOffsetReset;
 
-    @Value("${app.kafka.threshold.startup-replay-enabled:true}")
+    @Value("${app.kafka.threshold.startup-replay-enabled:false}")
     private boolean startupReplayEnabled;
 
     @Value("${app.kafka.threshold.startup-replay-records:200}")
@@ -93,7 +93,7 @@ public class SensorDataConsumer {
     @Value("${app.kafka.threshold.poll-interval-ms:100}")
     private long pollIntervalMs;
 
-    @Value("${app.kafka.threshold.poller-enabled:true}")
+    @Value("${app.kafka.threshold.poller-enabled:false}")
     private boolean pollerEnabled;
 
     @Value("${app.kafka.threshold.processing-threads:2}")
@@ -568,4 +568,3 @@ public class SensorDataConsumer {
         return summary;
     }
 }
-

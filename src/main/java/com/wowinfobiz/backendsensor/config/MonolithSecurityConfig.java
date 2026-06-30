@@ -55,6 +55,7 @@ public class MonolithSecurityConfig {
                                 "/api/v1/ingestion/**",
                                 "/api/v1/processing/readings/live",
                                 "/api/v1/analytics/live",
+                                "/api/v1/analytics/events/live",
                                 "/error"
                         ).permitAll()
                         .requestMatchers("/api/v1/super-admins/**", "/api/v1/vendors/**").hasRole("SUPER_ADMIN")

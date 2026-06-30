@@ -4,8 +4,10 @@ import com.wowinfobiz.ingestionservice.dto.SensorReadingRequest;
 import com.wowinfobiz.ingestionservice.dto.SensorReadingResponse;
 import com.wowinfobiz.ingestionservice.dto.SensorReadingView;
 import com.wowinfobiz.ingestionservice.model.SensorReading;
+import com.wowinfobiz.processingservice.controller.ProcessingController;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.lang.Nullable;
@@ -34,12 +36,18 @@ public class IngestionService {
     private final List<SseEmitter> emitters = new CopyOnWriteArrayList<>();
     @Nullable
     private final KafkaTemplate<Object, Object> kafkaTemplate;
+    private final ObjectProvider<ProcessingController> processingControllerProvider;
     private final String ingestionTopic;
+    private final boolean directProcessingEnabled;
 
     public IngestionService(@Nullable KafkaTemplate<Object, Object> kafkaTemplate,
-                            @Value("${app.kafka.topics.ingestion}") String ingestionTopic) {
+                            ObjectProvider<ProcessingController> processingControllerProvider,
+                            @Value("${app.kafka.topics.ingestion}") String ingestionTopic,
+                            @Value("${app.ingestion.direct-processing.enabled:true}") boolean directProcessingEnabled) {
         this.kafkaTemplate = kafkaTemplate;
+        this.processingControllerProvider = processingControllerProvider;
         this.ingestionTopic = ingestionTopic;
+        this.directProcessingEnabled = directProcessingEnabled;
     }
 
     public SensorReadingResponse saveReading(SensorReadingRequest request) {
@@ -53,6 +61,8 @@ public class IngestionService {
         SensorReading reading = new SensorReading(readingId, sensorId, timestamp, parameters);
         readingsById.put(readingId, reading);
         publishUpdate(toView(reading));
+        Map<String, Object> processingPayload = buildProcessingPayload(reading, null);
+        processDirectly(processingPayload);
         publishToKafka(reading, null);
         return new SensorReadingResponse("SUCCESS", "Reading stored successfully", readingId);
     }
@@ -71,6 +81,8 @@ public class IngestionService {
         );
         readingsById.put(readingId, reading);
         publishUpdate(toView(reading));
+        Map<String, Object> processingPayload = buildProcessingPayload(reading, payload);
+        processDirectly(processingPayload);
         publishToKafka(reading, payload);
 
         return new SensorReadingResponse("SUCCESS", "Reading stored successfully", readingId);
@@ -230,17 +242,7 @@ public class IngestionService {
             LOG.warn("KafkaTemplate bean not found. Skipping publish for reading {}", reading.getReadingId());
             return;
         }
-        String dataType = resolveDataType(sourcePayload, reading.getParameters());
-        System.out.println("DATA TYPE SEND: "+dataType);
-        Map<String, Object> payload = new LinkedHashMap<>();
-        payload.put("readingId", reading.getReadingId());
-        payload.put("sensorId", reading.getSensorId());
-        payload.put("timestamp", reading.getTimestamp());
-        payload.put("parameters", reading.getParameters());
-        payload.put("dataType", dataType);
-        payload.put("data_type", dataType);
-        payload.put("sensorType", dataType);
-
+        Map<String, Object> payload = buildProcessingPayload(reading, sourcePayload);
         String key = reading.getSensorId();
         kafkaTemplate.send(ingestionTopic, key, payload).whenComplete((result, ex) -> {
             if (ex != null) {
@@ -257,6 +259,36 @@ public class IngestionService {
                 }
             }
         });
+    }
+
+    private Map<String, Object> buildProcessingPayload(SensorReading reading, @Nullable Map<String, Object> sourcePayload) {
+        String dataType = resolveDataType(sourcePayload, reading.getParameters());
+        System.out.println("DATA TYPE SEND: "+dataType);
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("readingId", reading.getReadingId());
+        payload.put("sensorId", reading.getSensorId());
+        payload.put("timestamp", reading.getTimestamp());
+        payload.put("parameters", reading.getParameters());
+        payload.put("dataType", dataType);
+        payload.put("data_type", dataType);
+        payload.put("sensorType", dataType);
+        return payload;
+    }
+
+    private void processDirectly(Map<String, Object> payload) {
+        if (!directProcessingEnabled) {
+            return;
+        }
+        ProcessingController processingController = processingControllerProvider.getIfAvailable();
+        if (processingController == null) {
+            LOG.warn("ProcessingController bean not found. Skipping direct processing.");
+            return;
+        }
+        try {
+            processingController.processPayload(payload);
+        } catch (Exception ex) {
+            LOG.error("Direct processing failed for reading {}", payload.get("readingId"), ex);
+        }
     }
 
     private String resolveDataType(@Nullable Map<String, Object> sourcePayload, Map<String, Object> parameters) {
