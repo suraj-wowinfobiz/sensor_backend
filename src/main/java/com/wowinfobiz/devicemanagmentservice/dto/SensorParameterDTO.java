@@ -10,6 +10,10 @@ public class SensorParameterDTO {
     String unit;
     double minValue;
     double maxValue;
+    String calculationName;
+    String formulaType;
+    String graphType;
+    String useFor;
 
     public UUID getSensorParameterId() {
         return sensorParameterId;
@@ -57,5 +61,37 @@ public class SensorParameterDTO {
 
     public void setMaxValue(double maxValue) {
         this.maxValue = maxValue;
+    }
+
+    public String getCalculationName() {
+        return calculationName;
+    }
+
+    public void setCalculationName(String calculationName) {
+        this.calculationName = calculationName;
+    }
+
+    public String getFormulaType() {
+        return formulaType;
+    }
+
+    public void setFormulaType(String formulaType) {
+        this.formulaType = formulaType;
+    }
+
+    public String getGraphType() {
+        return graphType;
+    }
+
+    public void setGraphType(String graphType) {
+        this.graphType = graphType;
+    }
+
+    public String getUseFor() {
+        return useFor;
+    }
+
+    public void setUseFor(String useFor) {
+        this.useFor = useFor;
     }
 }

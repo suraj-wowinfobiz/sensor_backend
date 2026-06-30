@@ -380,7 +380,7 @@ public class ProcessingController {
             case "piezometer", "piezo" -> piezoMeter.processSensorData(request);
             case "strainguage", "straingauge", "strain" -> strainGuage.processSensorData(request);
             case "temprator", "temperature", "tempratorsensor" -> tempratorSensor.processSensorData(request);
-            case "tiltmeter", "tilt" -> tiltMeter.processSensorData(request);
+            case "tiltmeter", "tiltmoter", "tilt" -> tiltMeter.processSensorData(request);
             case "vibration", "vibrationsensor" -> vibrationSensor.processSensorData(request);
             default -> new ProcessDataResponse<>("Unsupported dataType: " + request.getDataType(), false, Map.of(
                     "sensorId", request.getSensorId(),
