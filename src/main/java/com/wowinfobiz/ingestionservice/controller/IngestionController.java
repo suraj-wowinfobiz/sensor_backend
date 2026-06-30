@@ -94,7 +94,12 @@ public class IngestionController {
                                                                                 @RequestHeader(value = HttpHeaders.CONTENT_TYPE, required = false) String contentType) {
         SensorEndpointSupport.ResolvedSensorEndpoint resolved = sensorEndpointSupport.resolveByEndpointKey(endpointKey)
                 .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "Sensor endpoint not found"));
-        liveEndpointAccessService.requireUserForSensor(userId, resolved.sensorId());
+        liveEndpointAccessService.requireUserForSensor(
+                userId,
+                resolved.sensorId(),
+                resolved.device().getSiteId(),
+                resolved.device().getZoneId()
+        );
 
         Map<String, Object> payload = parseInboundPayload(rawBody, queryParams);
         if (!payload.isEmpty()) {
