@@ -16,6 +16,7 @@ import java.io.IOException;
 import java.time.Instant;
 import java.time.format.DateTimeParseException;
 import java.util.*;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.stream.Collectors;
@@ -31,14 +32,18 @@ public class IngestionService {
     private static final List<String> DATA_TYPE_KEYS = List.of("dataType", "data_type", "sensorType", "sensor_type", "type");
 
     private final Map<UUID, SensorReading> readingsById = new ConcurrentHashMap<>();
+    private final Queue<UUID> readingOrder = new ConcurrentLinkedQueue<>();
     private final List<ReadingSubscriber> subscribers = new CopyOnWriteArrayList<>();
     private final ObjectProvider<ProcessingController> processingControllerProvider;
     private final boolean directProcessingEnabled;
+    private final int liveHistoryLimit;
 
     public IngestionService(ObjectProvider<ProcessingController> processingControllerProvider,
-                            @Value("${app.ingestion.direct-processing.enabled:true}") boolean directProcessingEnabled) {
+                            @Value("${app.ingestion.direct-processing.enabled:true}") boolean directProcessingEnabled,
+                            @Value("${app.ingestion.live-history-limit:200}") int liveHistoryLimit) {
         this.processingControllerProvider = processingControllerProvider;
         this.directProcessingEnabled = directProcessingEnabled;
+        this.liveHistoryLimit = Math.max(liveHistoryLimit, 0);
     }
 
     public SensorReadingResponse saveReading(SensorReadingRequest request) {
@@ -51,6 +56,7 @@ public class IngestionService {
 
         SensorReading reading = new SensorReading(readingId, sensorId, timestamp, parameters);
         readingsById.put(readingId, reading);
+        rememberReading(readingId);
         publishUpdate(toView(reading));
         Map<String, Object> processingPayload = buildProcessingPayload(reading, null);
         processDirectly(processingPayload);
@@ -70,6 +76,7 @@ public class IngestionService {
                 parameters
         );
         readingsById.put(readingId, reading);
+        rememberReading(readingId);
         publishUpdate(toView(reading));
         Map<String, Object> processingPayload = buildProcessingPayload(reading, payload);
         processDirectly(processingPayload);
@@ -121,9 +128,10 @@ public class IngestionService {
         emitter.onError(ex -> subscribers.remove(subscriber));
 
         try {
+            List<SensorReadingView> snapshot = recentReadings(subscriber.sensorIdFilter(), liveHistoryLimit);
             emitter.send(SseEmitter.event()
                     .name("snapshot")
-                    .data(getReadings(subscriber.sensorIdFilter(), null, null)));
+                    .data(snapshot));
         } catch (IOException ex) {
             subscribers.remove(subscriber);
             emitter.completeWithError(ex);
@@ -231,6 +239,38 @@ public class IngestionService {
             }
         }
         subscribers.removeAll(deadSubscribers);
+    }
+
+    private void rememberReading(UUID readingId) {
+        if (readingId == null) {
+            return;
+        }
+        readingOrder.add(readingId);
+        if (liveHistoryLimit <= 0) {
+            UUID removedId;
+            while ((removedId = readingOrder.poll()) != null) {
+                readingsById.remove(removedId);
+            }
+            return;
+        }
+        while (readingOrder.size() > liveHistoryLimit) {
+            UUID oldest = readingOrder.poll();
+            if (oldest == null) {
+                break;
+            }
+            readingsById.remove(oldest);
+        }
+    }
+
+    private List<SensorReadingView> recentReadings(String sensorIdFilter, int limit) {
+        if (limit == 0) {
+            return List.of();
+        }
+        List<SensorReadingView> records = getReadings(sensorIdFilter, null, null);
+        if (limit < 0 || records.size() <= limit) {
+            return records;
+        }
+        return records.subList(records.size() - limit, records.size());
     }
 
     private Map<String, Object> buildProcessingPayload(SensorReading reading, Map<String, Object> sourcePayload) {

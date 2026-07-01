@@ -9,6 +9,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
@@ -19,6 +20,7 @@ import java.util.List;
 import java.util.Map;
 
 @Service
+@Transactional(readOnly = true)
 public class AnalyticsEventStore {
     private static final Logger LOG = LoggerFactory.getLogger(AnalyticsEventStore.class);
 
@@ -30,6 +32,7 @@ public class AnalyticsEventStore {
         this.objectMapper = objectMapper;
     }
 
+    @Transactional
     public void addEvent(Map<String, Object> event) {
         Map<String, Object> normalized = normalizeEvent(event);
         AnalyticsEventEntity entity = new AnalyticsEventEntity();

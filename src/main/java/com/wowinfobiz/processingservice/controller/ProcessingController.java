@@ -52,6 +52,7 @@ import java.util.concurrent.atomic.AtomicLong;
 public class ProcessingController {
 
     private static final Logger LOG = LoggerFactory.getLogger(ProcessingController.class);
+    private static final int LIVE_SNAPSHOT_LIMIT = 25;
 
     private final ObjectMapper objectMapper;
     private final Accelerometer accelerometer;
@@ -186,18 +187,16 @@ public class ProcessingController {
         try {
             Map<String, Object> connectedEvent = Map.of("type", "connected", "message", "Live stream connected", "data", emitter.toString());
             emitter.send(SseEmitter.event().name("connected").data(connectedEvent));
-            // Also send unnamed event so clients using EventSource.onmessage receive it.
-            emitter.send(SseEmitter.event().data(connectedEvent));
 
             List<Map<String, Object>> existing = processedReadingStoreService.findReadings(null, null, null).stream()
                     .filter(record -> matchesSensor(subscriber.sensorIdFilter(), valueAsString(record.get("sensorId"))))
+                    .limit(LIVE_SNAPSHOT_LIMIT)
                     .toList();
             Map<String, Object> snapshotEvent = new LinkedHashMap<>();
             snapshotEvent.put("type", "snapshot");
             snapshotEvent.put("count", existing.size());
             snapshotEvent.put("records", existing);
             emitter.send(SseEmitter.event().name("snapshot").data(snapshotEvent));
-            emitter.send(SseEmitter.event().data(snapshotEvent));
         } catch (IOException ex) {
             liveSubscribers.remove(subscriber);
             emitter.completeWithError(ex);
@@ -323,7 +322,9 @@ public class ProcessingController {
         }
 
         broadcastLiveUpdate(request, response, rawPayload);
-        publishAnalyticsLiveEvent(request, response, rawPayload);
+        if (publishError != null) {
+            publishAnalyticsLiveEvent(request, response);
+        }
     }
 
     private Throwable waitForFuture(CompletableFuture<Void> future) {
@@ -360,8 +361,6 @@ public class ProcessingController {
             }
             try {
                 subscriber.emitter().send(SseEmitter.event().name("reading").data(event));
-                // Also emit unnamed event for generic onmessage listeners.
-                subscriber.emitter().send(SseEmitter.event().data(event));
             } catch (IOException ex) {
                 deadSubscribers.add(subscriber);
             }
@@ -464,8 +463,7 @@ public class ProcessingController {
     }
 
     private void publishAnalyticsLiveEvent(SensorRawDataRequest<?> request,
-                                           ProcessDataResponse<?> response,
-                                           Map<String, Object> rawPayload) {
+                                           ProcessDataResponse<?> response) {
         try {
             Map<String, Object> thresholdPayload = buildThresholdPayload(request, response);
             Map<String, Object> calculatedValues = thresholdPayload.get("calculatedValues") instanceof Map<?, ?> map
@@ -492,9 +490,7 @@ public class ProcessingController {
             event.put("dataType", request.getDataType());
             event.put("evaluations", evaluations);
             event.put("alertCount", 0);
-            event.put("source", "processing-service");
-            event.put("rawPayload", rawPayload);
-            event.put("processedPayload", response.getBody());
+            event.put("source", "processing-service-fallback");
 
             analyticsEventSubject.publish(event);
         } catch (Exception ex) {
