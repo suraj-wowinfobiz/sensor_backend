@@ -125,17 +125,23 @@ public class ProcessingController {
     @GetMapping({"/readings"})
     public ResponseEntity<?> getAllProcessedReadings(@RequestParam(name = "sensorId", required = false) UUID sensorId,
                                                      @RequestParam(name = "from", required = false) Instant from,
-                                                     @RequestParam(name = "to", required = false) Instant to) {
+                                                     @RequestParam(name = "to", required = false) Instant to,
+                                                     @RequestParam(name = "limit", required = false) Integer limit) {
         if (from != null && to != null && from.isAfter(to)) {
             return ResponseEntity.badRequest().body(new ProcessDataResponse<>("Invalid range: 'from' must be before 'to'", false, Map.of()));
         }
 
         List<Map<String, Object>> records = processedReadingStoreService.findReadings(sensorId, from, to);
+        int safeLimit = limit == null ? 0 : Math.max(limit, 0);
+        if (safeLimit > 0 && records.size() > safeLimit) {
+            records = records.subList(0, safeLimit);
+        }
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("count", records.size());
         body.put("sensorId", sensorId);
         body.put("from", from);
         body.put("to", to);
+        body.put("limit", safeLimit > 0 ? safeLimit : null);
         body.put("records", records);
 
         return ResponseEntity.ok(new ProcessDataResponse<>("Processed readings fetched successfully", true, body));
