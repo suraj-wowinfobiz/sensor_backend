@@ -16,6 +16,9 @@ public class ThresholdValueEntity {
     @Column(name = "sensor_parameter_id")
     private UUID sensorParameterId;
 
+    @Column(name = "sensor_id")
+    private UUID sensorId;
+
     @ManyToOne
     @JoinColumn(name = "threshold_profile_id")
     private ThresholdProfileEntity thresholdProfile;
@@ -47,6 +50,14 @@ public class ThresholdValueEntity {
 
     public void setSensorParameterId(UUID sensorParameterId) {
         this.sensorParameterId = sensorParameterId;
+    }
+
+    public UUID getSensorId() {
+        return sensorId;
+    }
+
+    public void setSensorId(UUID sensorId) {
+        this.sensorId = sensorId;
     }
 
     public double getMinThresholdValue() {
@@ -92,9 +103,10 @@ public class ThresholdValueEntity {
         super();
     }
 
-    public ThresholdValueEntity(UUID thresholdValueId, UUID sensorParameterId, ThresholdProfileEntity thresholdProfile, double minThresholdValue, double maxThresholdValue, double warrningLevel, double criticalLevel) {
+    public ThresholdValueEntity(UUID thresholdValueId, UUID sensorParameterId, UUID sensorId, ThresholdProfileEntity thresholdProfile, double minThresholdValue, double maxThresholdValue, double warrningLevel, double criticalLevel) {
         this.thresholdValueId = thresholdValueId;
         this.sensorParameterId = sensorParameterId;
+        this.sensorId = sensorId;
         this.thresholdProfile = thresholdProfile;
         this.minThresholdValue = minThresholdValue;
         this.maxThresholdValue = maxThresholdValue;

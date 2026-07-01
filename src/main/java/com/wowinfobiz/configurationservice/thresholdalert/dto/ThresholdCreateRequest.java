@@ -9,6 +9,8 @@ public class ThresholdCreateRequest {
     private double minThresholdValue;
     @JsonAlias({"sensorParamterId"})
     private UUID sensorParameterId;
+    @JsonAlias({"sensor_id"})
+    private UUID sensorId;
     private UUID thresholdProfileId;
     private double maxThresholdValue;
 
@@ -81,5 +83,12 @@ public class ThresholdCreateRequest {
     public void setThresholdProfileId(UUID thresholdProfileId) {
         this.thresholdProfileId = thresholdProfileId;
     }
-}
 
+    public UUID getSensorId() {
+        return sensorId;
+    }
+
+    public void setSensorId(UUID sensorId) {
+        this.sensorId = sensorId;
+    }
+}

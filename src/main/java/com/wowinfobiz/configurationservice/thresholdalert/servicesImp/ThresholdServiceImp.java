@@ -49,9 +49,22 @@ public class ThresholdServiceImp implements ThresholdService {
     @Override
     @Transactional
     public ResponseEntity<?> createThreshold(ThresholdCreateRequest threshold) {
-        ThresholdValueEntity entity = new ThresholdValueEntity();
-        entity.setThresholdValueId(UUID.randomUUID());
+        if (threshold == null || threshold.getSensorParameterId() == null) {
+            return ResponseEntity.badRequest().body("sensorParameterId is required");
+        }
+
+        Optional<ThresholdValueEntity> existingThreshold = findExistingThreshold(
+                threshold.getSensorId(),
+                threshold.getSensorParameterId()
+        );
+
+        ThresholdValueEntity entity = existingThreshold.orElseGet(ThresholdValueEntity::new);
+        boolean isNew = entity.getThresholdValueId() == null;
+        if (isNew) {
+            entity.setThresholdValueId(UUID.randomUUID());
+        }
         entity.setSensorParameterId(threshold.getSensorParameterId());
+        entity.setSensorId(threshold.getSensorId());
         entity.setMinThresholdValue(threshold.getMinThresholdValue());
         entity.setMaxThresholdValue(threshold.getMaxThresholdValue());
         entity.setWarrningLevel(threshold.getWarningLevel());
@@ -63,7 +76,7 @@ public class ThresholdServiceImp implements ThresholdService {
         }
 
         ThresholdValueEntity saved = thresholdValueRepository.save(entity);
-        return ResponseEntity.status(HttpStatus.CREATED).body(toThresholdValueResponse(saved));
+        return ResponseEntity.status(isNew ? HttpStatus.CREATED : HttpStatus.OK).body(toThresholdValueResponse(saved));
     }
 
     @Override
@@ -77,6 +90,7 @@ public class ThresholdServiceImp implements ThresholdService {
             if (threshold.getSensorParameterId() != null) {
                 existing.setSensorParameterId(threshold.getSensorParameterId());
             }
+            existing.setSensorId(threshold.getSensorId());
             if (threshold.getThresholdProfileId() != null) {
                 thresholdProfileRepository.findById(threshold.getThresholdProfileId())
                         .ifPresent(existing::setThresholdProfile);
@@ -185,12 +199,20 @@ public class ThresholdServiceImp implements ThresholdService {
         ThresholdValueResponse response = new ThresholdValueResponse();
         response.setThresholdValueId(entity.getThresholdValueId());
         response.setSensorParameterId(entity.getSensorParameterId());
+        response.setSensorId(entity.getSensorId());
         response.setThresholdProfileId(entity.getThresholdProfile() == null ? null : entity.getThresholdProfile().getThresholdProfileId());
         response.setMinThresholdValue(entity.getMinThresholdValue());
         response.setMaxThresholdValue(entity.getMaxThresholdValue());
         response.setWarningLevel(entity.getWarrningLevel());
         response.setCriticalLevel(entity.getCriticalLevel());
         return response;
+    }
+
+    private Optional<ThresholdValueEntity> findExistingThreshold(UUID sensorId, UUID sensorParameterId) {
+        List<ThresholdValueEntity> matches = sensorId == null
+                ? thresholdValueRepository.findAllBySensorIdIsNullAndSensorParameterId(sensorParameterId)
+                : thresholdValueRepository.findAllBySensorIdAndSensorParameterId(sensorId, sensorParameterId);
+        return matches.stream().findFirst();
     }
 
     private ThresholdProfileResponse toThresholdProfileResponse(ThresholdProfileEntity entity) {
@@ -213,4 +235,3 @@ public class ThresholdServiceImp implements ThresholdService {
         return response;
     }
 }
-

@@ -5,6 +5,7 @@ import java.util.UUID;
 public class ThresholdValueResponse {
     private UUID thresholdValueId;
     private UUID sensorParameterId;
+    private UUID sensorId;
     private UUID thresholdProfileId;
     private double minThresholdValue;
     private double maxThresholdValue;
@@ -25,6 +26,14 @@ public class ThresholdValueResponse {
 
     public void setSensorParameterId(UUID sensorParameterId) {
         this.sensorParameterId = sensorParameterId;
+    }
+
+    public UUID getSensorId() {
+        return sensorId;
+    }
+
+    public void setSensorId(UUID sensorId) {
+        this.sensorId = sensorId;
     }
 
     public UUID getThresholdProfileId() {
@@ -67,4 +76,3 @@ public class ThresholdValueResponse {
         this.criticalLevel = criticalLevel;
     }
 }
-

@@ -3,9 +3,12 @@ package com.wowinfobiz.thresholdalertservice.services;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.wowinfobiz.analyticsservice.services.observer.AnalyticsEventSubject;
+import com.wowinfobiz.devicemanagmentservice.dto.SensorDTO;
 import com.wowinfobiz.devicemanagmentservice.dto.SensorParameterDTO;
+import com.wowinfobiz.devicemanagmentservice.models.SensorDocument;
 import com.wowinfobiz.devicemanagmentservice.models.SensorParameterDocument;
 import com.wowinfobiz.devicemanagmentservice.models.SensorParameters;
+import com.wowinfobiz.devicemanagmentservice.repository.SensorDocumentRepository;
 import com.wowinfobiz.devicemanagmentservice.repository.SensorParameterDocumentRepository;
 import com.wowinfobiz.devicemanagmentservice.repository.SensorParametersRepository;
 import com.wowinfobiz.thresholdalertservice.dto.SensorDataDTO;
@@ -19,6 +22,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Date;
@@ -35,6 +39,7 @@ import java.util.concurrent.atomic.AtomicLong;
 public class SensorDataProcessor {
 
     private static final Logger LOG = LoggerFactory.getLogger(SensorDataProcessor.class);
+    private static final Duration LOOKUP_CACHE_TTL = Duration.ofSeconds(30);
 
     @Autowired
     private ThresholdValueRepository thresholdValueRepository;
@@ -44,6 +49,9 @@ public class SensorDataProcessor {
 
     @Autowired
     private SensorParameterDocumentRepository sensorParameterDocumentRepository;
+
+    @Autowired
+    private SensorDocumentRepository sensorDocumentRepository;
 
     @Autowired
     private SensorParametersRepository sensorParametersRepository;
@@ -57,6 +65,9 @@ public class SensorDataProcessor {
     private final AtomicLong processedCount = new AtomicLong(0);
     private volatile Instant lastProcessedAt;
     private volatile Map<String, Object> lastPayloadSummary = Map.of();
+    private volatile Instant sensorParameterCacheLoadedAt = Instant.EPOCH;
+    private volatile List<SensorParameterDTO> cachedSensorParameters = List.of();
+    private volatile List<SensorParameters> cachedLegacySensorParameters = List.of();
 
     public void processRawPayload(byte[] payloadBytes) {
         try {
@@ -115,7 +126,7 @@ public class SensorDataProcessor {
                     continue;
                 }
                 String parameterName = entry.getKey();
-                UUID sensorParameterId = resolveSensorParameterId(parameterName, payload.get("sensorParameterId"));
+                UUID sensorParameterId = resolveSensorParameterId(sensorId, parameterName, payload.get("sensorParameterId"));
                 evaluations.add(evaluateOne(sensorId, sensorParameterId, parameterName, value));
             }
         }
@@ -162,30 +173,56 @@ public class SensorDataProcessor {
         if (sensorData.getSensorParameterId() == null) {
             return null;
         }
-        Optional<ThresholdValueEntity> thresholdOpt = thresholdValueRepository
-                .findBySensorParameterId(sensorData.getSensorParameterId());
 
+        Optional<ThresholdValueEntity> thresholdOpt = resolveThreshold(
+                sensorData.getSensorId(),
+                sensorData.getSensorParameterId()
+        );
         if (thresholdOpt.isEmpty()) {
             return null;
         }
 
         ThresholdValueEntity threshold = thresholdOpt.get();
         String alertLevel = null;
-        String message = null;
 
         if (sensorData.getValue() >= threshold.getCriticalLevel()) {
             alertLevel = "CRITICAL";
-            message = "CRITICAL: " + sensorData.getParameterName() + " exceeded critical threshold. Value: " + sensorData.getValue();
         } else if (sensorData.getValue() >= threshold.getWarrningLevel()) {
             alertLevel = "WARNING";
-            message = "WARNING: " + sensorData.getParameterName() + " exceeded warning threshold. Value: " + sensorData.getValue();
-        } else if (sensorData.getValue() < threshold.getMinThresholdValue() || sensorData.getValue() > threshold.getMaxThresholdValue()) {
+        } else if (sensorData.getValue() < threshold.getMinThresholdValue()
+                || sensorData.getValue() > threshold.getMaxThresholdValue()) {
             alertLevel = "INFO";
-            message = "INFO: " + sensorData.getParameterName() + " out of normal range. Value: " + sensorData.getValue();
         }
 
+        AlertEntity existingActiveAlert = findActiveAlert(
+                sensorData.getSensorId(),
+                sensorData.getSensorParameterId()
+        );
+
         if (alertLevel == null) {
+            if (existingActiveAlert != null) {
+                existingActiveAlert.setResolvedAt(new Date());
+                existingActiveAlert.setStatus("RESOLVED");
+                alertRepository.save(existingActiveAlert);
+            }
             return null;
+        }
+
+        String message = buildAlertMessage(sensorData, threshold, alertLevel);
+        if (existingActiveAlert != null) {
+            boolean changed = !alertLevel.equalsIgnoreCase(existingActiveAlert.getAlertLevel())
+                    || !Objects.equals(message, existingActiveAlert.getMessage())
+                    || !"ACTIVE".equalsIgnoreCase(existingActiveAlert.getStatus());
+            if (!changed) {
+                return null;
+            }
+            existingActiveAlert.setAlertLevel(alertLevel);
+            existingActiveAlert.setMessage(message);
+            existingActiveAlert.setTriggeredAt(new Date());
+            existingActiveAlert.setResolvedAt(null);
+            existingActiveAlert.setAcknowledgedAt(null);
+            existingActiveAlert.setStatus("ACTIVE");
+            return alertRepository.save(existingActiveAlert);
         }
 
         AlertEntity alert = new AlertEntity();
@@ -235,13 +272,15 @@ public class SensorDataProcessor {
         }
     }
 
-    private UUID resolveSensorParameterId(String parameterName, Object fallbackValue) {
+    private UUID resolveSensorParameterId(UUID sensorId, String parameterName, Object fallbackValue) {
         String normalizedParameter = normalizeName(parameterName);
         if (!normalizedParameter.isBlank()) {
-            Optional<UUID> fromDocument = sensorParameterDocumentRepository.findAll().stream()
-                    .map(this::readSensorParameterDocument)
-                    .filter(Objects::nonNull)
-                    .filter(parameter -> namesMatch(parameter.getName(), parameterName, normalizedParameter))
+            UUID sensorTypeId = resolveSensorTypeId(sensorId);
+            Optional<UUID> fromDocument = currentSensorParameters().stream()
+                    .filter(parameter -> sensorTypeId == null
+                            || parameter.getSensorTypeId() == null
+                            || sensorTypeId.equals(parameter.getSensorTypeId()))
+                    .filter(parameter -> parameterMatches(parameter, parameterName, normalizedParameter))
                     .map(SensorParameterDTO::getSensorParameterId)
                     .filter(Objects::nonNull)
                     .findFirst();
@@ -249,17 +288,16 @@ public class SensorDataProcessor {
                 return fromDocument.get();
             }
 
-            try {
-                Optional<UUID> fromEntity = sensorParametersRepository.findAll().stream()
-                        .filter(parameter -> namesMatch(parameter.getName(), parameterName, normalizedParameter))
-                        .map(SensorParameters::getSensorParameterId)
-                        .filter(Objects::nonNull)
-                        .findFirst();
-                if (fromEntity.isPresent()) {
-                    return fromEntity.get();
-                }
-            } catch (Exception ex) {
-                LOG.debug("Legacy sensor_parameter lookup skipped for {}", parameterName, ex);
+            Optional<UUID> fromEntity = currentLegacySensorParameters().stream()
+                    .filter(parameter -> sensorTypeId == null
+                            || parameter.getSensorTypeId() == null
+                            || sensorTypeId.equals(parameter.getSensorTypeId()))
+                    .filter(parameter -> namesMatch(parameter.getName(), parameterName, normalizedParameter))
+                    .map(SensorParameters::getSensorParameterId)
+                    .filter(Objects::nonNull)
+                    .findFirst();
+            if (fromEntity.isPresent()) {
+                return fromEntity.get();
             }
         }
         return parseUuid(fallbackValue, false);
@@ -275,6 +313,149 @@ public class SensorDataProcessor {
             LOG.debug("Unable to read sensor parameter document {}", document.getId(), ex);
             return null;
         }
+    }
+
+    private SensorDTO readSensorDocument(SensorDocument document) {
+        if (document == null || document.getData() == null || document.getData().isBlank()) {
+            return null;
+        }
+        try {
+            return objectMapper.readValue(document.getData(), SensorDTO.class);
+        } catch (Exception ex) {
+            LOG.debug("Unable to read sensor document {}", document.getId(), ex);
+            return null;
+        }
+    }
+
+    private UUID resolveSensorTypeId(UUID sensorId) {
+        if (sensorId == null) {
+            return null;
+        }
+        return sensorDocumentRepository.findById(sensorId)
+                .map(this::readSensorDocument)
+                .map(SensorDTO::getSensorTypeId)
+                .orElse(null);
+    }
+
+    private List<SensorParameterDTO> currentSensorParameters() {
+        if (Instant.now().isBefore(sensorParameterCacheLoadedAt.plus(LOOKUP_CACHE_TTL))
+                && !cachedSensorParameters.isEmpty()) {
+            return cachedSensorParameters;
+        }
+        List<SensorParameterDTO> refreshed = sensorParameterDocumentRepository.findAll().stream()
+                .map(this::readSensorParameterDocument)
+                .filter(Objects::nonNull)
+                .toList();
+        cachedSensorParameters = refreshed;
+        try {
+            cachedLegacySensorParameters = sensorParametersRepository.findAll();
+        } catch (Exception ex) {
+            LOG.debug("Legacy sensor_parameter cache refresh skipped", ex);
+            cachedLegacySensorParameters = List.of();
+        }
+        sensorParameterCacheLoadedAt = Instant.now();
+        return refreshed;
+    }
+
+    private List<SensorParameters> currentLegacySensorParameters() {
+        currentSensorParameters();
+        return cachedLegacySensorParameters;
+    }
+
+    private boolean parameterMatches(SensorParameterDTO parameter, String parameterName, String normalizedParameter) {
+        return namesMatch(parameter.getName(), parameterName, normalizedParameter)
+                || namesMatch(parameter.getCalculationName(), parameterName, normalizedParameter);
+    }
+
+    private Optional<ThresholdValueEntity> resolveThreshold(UUID sensorId, UUID sensorParameterId) {
+        if (sensorParameterId == null) {
+            return Optional.empty();
+        }
+        if (sensorId != null) {
+            List<ThresholdValueEntity> sensorSpecificThresholds =
+                    thresholdValueRepository.findAllBySensorIdAndSensorParameterId(sensorId, sensorParameterId);
+            if (!sensorSpecificThresholds.isEmpty()) {
+                return sensorSpecificThresholds.stream().findFirst();
+            }
+        }
+        List<ThresholdValueEntity> globalThresholds =
+                thresholdValueRepository.findAllBySensorIdIsNullAndSensorParameterId(sensorParameterId);
+        return globalThresholds.stream().findFirst();
+    }
+
+    private AlertEntity findActiveAlert(UUID sensorId, UUID sensorParameterId) {
+        List<AlertEntity> matches = sensorId == null
+                ? alertRepository.findBySensorParameterIdAndResolvedAtIsNull(sensorParameterId)
+                : alertRepository.findBySensorIdAndSensorParameterIdAndResolvedAtIsNull(sensorId, sensorParameterId);
+        return matches.stream().findFirst().orElse(null);
+    }
+
+    private String buildAlertMessage(SensorDataDTO sensorData, ThresholdValueEntity threshold, String alertLevel) {
+        String sensorLabel = resolveSensorLabel(sensorData.getSensorId());
+        String parameterLabel = resolveParameterLabel(sensorData.getSensorParameterId(), sensorData.getParameterName());
+        String valueLabel = formatDecimal(sensorData.getValue());
+        if ("CRITICAL".equalsIgnoreCase(alertLevel)) {
+            return sensorLabel + " | " + parameterLabel + " reached " + valueLabel
+                    + " which is above the critical threshold of " + formatDecimal(threshold.getCriticalLevel());
+        }
+        if ("WARNING".equalsIgnoreCase(alertLevel)) {
+            return sensorLabel + " | " + parameterLabel + " reached " + valueLabel
+                    + " which is above the warning threshold of " + formatDecimal(threshold.getWarrningLevel());
+        }
+        return sensorLabel + " | " + parameterLabel + " is " + valueLabel
+                + " which is outside the allowed range of "
+                + formatDecimal(threshold.getMinThresholdValue()) + " to "
+                + formatDecimal(threshold.getMaxThresholdValue());
+    }
+
+    private String resolveSensorLabel(UUID sensorId) {
+        if (sensorId == null) {
+            return "Unknown sensor";
+        }
+        return sensorDocumentRepository.findById(sensorId)
+                .map(this::readSensorDocument)
+                .map(sensor -> {
+                    if (sensor == null) {
+                        return sensorId.toString();
+                    }
+                    if (sensor.getName() != null && !sensor.getName().isBlank()) {
+                        return sensor.getName().trim();
+                    }
+                    if (sensor.getSerialNumber() != null && !sensor.getSerialNumber().isBlank()) {
+                        return sensor.getSerialNumber().trim();
+                    }
+                    return sensorId.toString();
+                })
+                .orElse(sensorId.toString());
+    }
+
+    private String resolveParameterLabel(UUID sensorParameterId, String fallbackName) {
+        if (sensorParameterId != null) {
+            Optional<String> fromDocument = currentSensorParameters().stream()
+                    .filter(parameter -> sensorParameterId.equals(parameter.getSensorParameterId()))
+                    .map(parameter -> firstNonBlank(parameter.getName(), parameter.getCalculationName()))
+                    .filter(value -> value != null && !value.isBlank())
+                    .findFirst();
+            if (fromDocument.isPresent()) {
+                return fromDocument.get();
+            }
+            Optional<String> fromLegacy = currentLegacySensorParameters().stream()
+                    .filter(parameter -> sensorParameterId.equals(parameter.getSensorParameterId()))
+                    .map(SensorParameters::getName)
+                    .filter(value -> value != null && !value.isBlank())
+                    .findFirst();
+            if (fromLegacy.isPresent()) {
+                return fromLegacy.get();
+            }
+        }
+        return firstNonBlank(fallbackName, "value");
+    }
+
+    private String firstNonBlank(String primary, String fallback) {
+        if (primary != null && !primary.isBlank()) {
+            return primary.trim();
+        }
+        return fallback == null ? "" : fallback.trim();
     }
 
     private boolean namesMatch(String candidate, String parameterName, String normalizedParameter) {
@@ -296,6 +477,10 @@ public class SensorDataProcessor {
             return "";
         }
         return value.trim().toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9]", "");
+    }
+
+    private String formatDecimal(double value) {
+        return String.format(Locale.US, "%.2f", value);
     }
 
     private Map<String, Object> collectNumericValues(Map<String, Object> source) {

@@ -12,4 +12,6 @@ public interface AlertRepository extends JpaRepository<AlertEntity, UUID> {
     List<AlertEntity> findByAlertLevel(String alertLevel);
     List<AlertEntity> findByResolvedAtIsNull();
     List<AlertEntity> findByResolvedAtIsNotNull();
+    List<AlertEntity> findBySensorIdAndSensorParameterIdAndResolvedAtIsNull(UUID sensorId, UUID sensorParameterId);
+    List<AlertEntity> findBySensorParameterIdAndResolvedAtIsNull(UUID sensorParameterId);
 }
